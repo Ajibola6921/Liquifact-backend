@@ -1,571 +1,109 @@
-/**
- * @fileoverview Express application factory for the LiquiFact API.
- *
- * Wires together all middleware and routes in the correct order:
- * 1. CORS policy (environment-driven allowlist, 403 on blocked origins)
- * 2. Request body-size guardrails (100 KB global JSON, 512 KB invoice limit)
- * 3. URL-encoded body parser (50 KB limit)
- * 4. Input sanitization (strips control chars, normalises Unicode, removes
- *    prototype-pollution keys from body / params / query)
- * 5. Security headers, audit, request-id, correlation-id middleware
- * 6. Application routes — each with explicit validation boundaries:
- *    - Health / liveness / readiness probes  (query + body guards)
- *    - GET /api info                         (query guard + body guard)
- *    - GET  /api/invoices                    (query param validation)
- *    - POST /api/invoices                    (Zod body schema + 512 KB limit)
- *    - GET  /api/escrow/:invoiceId           (param allowlist + length bound)
- * 7. Feature router mounts (auth, KYC, marketplace, …)
- * 8. 404 catch-all
- * 9. CORS error handler  → 403 JSON
- * 10. Payload-too-large handler → 413 JSON
- * 11. Generic internal-error handler → 500 JSON
- *
- * @module app
- */
-
 'use strict';
-
-require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const { createSecurityMiddleware } = require('./middleware/security');
-const { auditMiddleware } = require('./middleware/audit');
+const helmet = require('helmet');
+const config = require('./config');
+const store = require('./data/store');
+const { buildSpec } = require('./openapi');
 
-const requestId = require('./middleware/requestId');
-const { correlationIdMiddleware } = require('./middleware/correlationId');
-const invoiceService = require('./services/invoiceService');
-const { CursorError } = require('./utils/cursorPagination');
-const { getEscrowRead } = require('./services/escrowReadService');
-const { createCorsOptions, isCorsOriginRejectedError } = require('./config/cors');
-const { corsObservability } = require('./middleware/corsObservability');
-const { get: getConfig } = require('./config');
-const { validateInvoiceQueryParams } = require('./utils/validators');
-const { invoiceCreateSchema, parseValidationErrors } = require('./schemas/invoice');
-const {
-  invoiceBodyLimit,
-  jsonBodyLimit,
-  payloadTooLargeHandler,
-  urlencodedBodyLimit,
-} = require('./middleware/bodySizeLimits');
-const healthRoutes = require('./routes/health');
-const { performHealthChecks, performReadinessChecks } = require('./services/health');
-const { validateHealthQuery, rejectBodyOnGet } = require('./schemas/health');
-const responseHelper = require('./utils/responseHelper');
-const logger = require('./logger');
-const { metricsAuth, metricsHandler } = require('./metrics');
-const { metricsLimiter } = require('./middleware/rateLimit');
-const { instrumentHealth } = require('./middleware/healthMetrics');
-const smeRoutes = require('./routes/sme');
-const invoiceFileRoutes = require('./routes/invoiceFile');
-const auditTrailRoutes = require('./routes/auditTrail');
-const investRoutes = require('./routes/invest');
-const investorRoutes = require('./routes/investor');
-const marketplaceRoutes = require('./routes/marketplace');
-const retentionRoutes = require('./routes/retention');
-const invoiceStateRoutes = require('./routes/invoiceStateRoutes');
-const adminEscrowRoutes = require('./routes/adminEscrow');
-const adminEscrowReadRoutes = require('./routes/adminEscrowRead');
-const adminWebhooksRoutes = require('./routes/adminWebhooks');
-const adminConfigRoutes = require('./routes/adminConfig');
-const kycRoutes = require('./routes/kyc');
-const adminKycRoutes = require('./routes/adminKyc');
-const reconciliationRoutes = require('./routes/reconciliation');
-const adminIndexerRoutes = require('./routes/adminIndexer');
-const adminMetricsRoutes = require('./routes/adminMetrics');
-const v1Routes = require('./routes/v1');
-const apiKeysRoutes = require('./routes/apiKeys');
-const {
-  mountFeatureRouter,
-  assertNoDuplicateRouterMounts,
-  resetFeatureRouterMounts,
-} = require('./utils/routeMountRegistry');
-const { createCompressionMiddleware } = require('./middleware/compression');
-const { configErrorHandler } = require('./middleware/configErrorHandler');
-const { sanitizeInput } = require('./middleware/sanitizeInput');
-const {
-  validateEscrowParamsMiddleware,
-  validateApiInfoQuery,
-  rejectBodyOnGet: rejectBodyOnGetInfo,
-} = require('./schemas/appBoundary');
+const app = express();
+app.disable('x-powered-by');
+app.set('trust proxy', true);
 
-/**
- * Returns a 403 JSON response only for the dedicated blocked-origin CORS error.
- *
- * @param {Error} err - Request error.
- * @param {import('express').Request} req - Express request.
- * @param {import('express').Response} res - Express response.
- * @param {import('express').NextFunction} next - Express next callback.
- * @returns {void}
- */
-function handleCorsError(err, req, res, next) {
-  if (isCorsOriginRejectedError(err)) {
-    if (res.locals) res.locals.isCorsOriginRejected = true;
-    res.status(403).json({ error: err.message, code: err.code });
-    return;
-  }
-  next(err);
-}
-
-/**
- * Handles uncaught application errors with a generic 500 response.
- *
- * @param {Error} err - Request error.
- * @param {import('express').Request} req - Express request.
- * @param {import('express').Response} res - Express response.
- * @param {import('express').NextFunction} _next - Express next callback (unused).
- * @returns {void}
- */
-function handleInternalError(err, req, res, _next) {
-  const isDevelopment = process.env.NODE_ENV === 'development';
-
-  if (err && (err.type === 'entity.parse.failed' || err.status === 400)) {
-    res.status(400).json({ error: 'Bad Request' });
-    return;
-  }
-
-  // AppError: use the status it carries (400–599).
-  // This covers both 4xx client errors and 5xx upstream errors (e.g. 502).
-  if (err && err.status && err.status >= 400 && err.status <= 599) {
-    res.status(err.status).json({
-      error: {
-        code: err.code || String(err.status),
-        message: err.detail || err.title || err.message,
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", 'https://unpkg.com'],
+        styleSrc: ["'self'", "'unsafe-inline'", 'https://unpkg.com'],
+        imgSrc: ["'self'", 'data:', 'https://unpkg.com'],
+        connectSrc: ["'self'"],
       },
-    });
-    return;
-  }
-
-  logger.error({ err, reqId: req.id }, 'Internal server error');
-  if (isDevelopment) {
-    res.status(500).json({
-      error: {
-        message: err && err.message ? err.message : 'Internal server error',
-        stack: err && err.stack ? err.stack : null,
-      },
-    });
-    return;
-  }
-
-  res.status(500).json({ error: 'Internal server error' });
-}
+    },
+  }),
+);
+app.use(cors({ origin: config.corsOrigins.includes('*') ? '*' : config.corsOrigins }));
+app.use(express.json({ limit: '100kb' }));
 
 /**
- * Creates the LiquiFact API application with configured middleware and routes.
- *
- * Exported as a factory function so each test suite can spin up a clean
- * instance without shared state.
- *
- * @returns {import('express').Express} Configured Express application.
+ * @param {import('express').Request} req incoming request
+ * @returns {string} public base URL of this deployment
  */
-function createApp() {
-  const app = express();
-
-  // ── 1. CORS ──────────────────────────────────────────────────────────────
-  app.use(corsObservability);
-  app.use(cors(createCorsOptions()));
-
-  // ── 1.a. KYC webhook raw body parser ──────────────────────────────────────
-  // Incoming provider webhooks must be verified against the raw JSON body.
-  app.use('/api/kyc/webhook', express.raw({
-    type: 'application/json',
-    limit: KYC_WEBHOOK_VALIDATION.MAX_PAYLOAD_BYTES,
-  }));
-
-  // ── 2 & 3. Body-size guardrails ──────────────────────────────────────────
-  app.use(...jsonBodyLimit());
-  app.use(...urlencodedBodyLimit());
-
-  // ── 4. Input sanitization ────────────────────────────────────────────────
-  // Runs after body parsers so req.body / req.params / req.query are already
-  // populated.  Strips control characters, normalises Unicode, and removes
-  // prototype-pollution keys from every user-supplied input container.
-  // Validation schemas then enforce structural correctness on top of this
-  // already-clean input.
-  app.use(sanitizeInput);
-
-  // Apply security headers middleware
-  app.use(createSecurityMiddleware());
-  app.use(auditMiddleware);
-  app.use(requestId);
-  app.use(correlationIdMiddleware);
-
-  // ── 5. Routes ────────────────────────────────────────────────────────────
-
-  // ── Health / Liveness / Readiness ──────────────────────────────────────
-  // Issue #769 — per-client rate limiter before individual handlers.
-  // Mounted first so monitoring scrapers and K8s probes all share the same
-  // per-client budget and a flood of unauthenticated requests is gated
-  // before it reaches the dependency checks.
-
-  // Liveness probe — no external dependencies
-  app.get('/health', rejectBodyOnGet, validateHealthQuery, instrumentHealth('health_liveness', (req, res) => {
-    res.json({
-      status: 'ok',
-      service: 'liquifact-api',
-      version: '0.1.0',
-      timestamp: new Date().toISOString(),
-    });
-  }));
-
-  // Liveness alias (Kubernetes convention)
-  app.get('/healthz', rejectBodyOnGet, validateHealthQuery, instrumentHealth('health_liveness', (req, res) => {
-    res.json({
-      status: 'ok',
-      service: 'liquifact-api',
-      version: '0.1.0',
-      timestamp: new Date().toISOString(),
-    });
-  }));
-
-  // Full health check (all dependencies)
-  app.get('/ready', rejectBodyOnGet, validateHealthQuery, instrumentHealth('health_full', async (req, res) => {
-    try {
-      const { healthy, checks } = await performHealthChecks();
-      const status = healthy ? 200 : 503;
-
-      res.status(status).json({
-        ready: healthy,
-        service: 'liquifact-api',
-        timestamp: new Date().toISOString(),
-        checks,
-      });
-    } catch (error) {
-      res.status(503).json({
-        ready: false,
-        service: 'liquifact-api',
-        timestamp: new Date().toISOString(),
-        error: error.message,
-      });
-    }
-  }));
-
-  // Readiness probe (critical deps only: DB, Soroban RPC)
-  app.get('/readyz', rejectBodyOnGet, validateHealthQuery, instrumentHealth('health_readiness', async (req, res) => {
-    try {
-      const { healthy, checks } = await performReadinessChecks();
-      const status = healthy ? 200 : 503;
-
-      res.status(status).json({
-        ready: healthy,
-        service: 'liquifact-api',
-        timestamp: new Date().toISOString(),
-        checks,
-      });
-    } catch (error) {
-      res.status(503).json({
-        ready: false,
-        service: 'liquifact-api',
-        timestamp: new Date().toISOString(),
-        error: error.message,
-      });
-    }
-  }));
-
-  // API info — read-only metadata; reject query params and bodies (GET invariant)
-  app.get('/api', rejectBodyOnGetInfo, validateApiInfoQuery, (req, res) => {
-    res.json({
-      name: 'LiquiFact API',
-      description: 'Global Invoice Liquidity Network on Stellar',
-      endpoints: {
-        health: 'GET /health',
-        healthz: 'GET /healthz',
-        ready: 'GET /ready',
-        readyz: 'GET /readyz',
-        invoices: 'GET/POST /api/invoices',
-        escrow: 'GET /api/escrow/:invoiceId',
-        marketplace: 'GET /api/marketplace',
-        invest: 'GET /api/invest/opportunities, GET /api/invest/list',
-      },
-    });
-  });
-
-  app.use('/api/api-keys', apiKeysRoutes);
-
-  // Invoices — GET (list)
-  app.get('/api/invoices', async (req, res) => {
-    const { isValid, fieldErrors, validatedParams } = validateInvoiceQueryParams(req.query);
-    if (!isValid) {
-      return res.status(400).json({
-        type: 'https://liquifact.io/problems/validation-error',
-        title: 'Validation Error',
-        status: 400,
-        detail: 'Query parameters contain invalid values.',
-        fieldErrors,
-      });
-    }
-
-    let result;
-    try {
-      result = await invoiceService.getInvoicesWithPagination(validatedParams);
-    } catch (err) {
-      if (err instanceof CursorError) {
-        return res.status(400).json({
-          type: 'https://liquifact.io/problems/validation-error',
-          title: 'Validation Error',
-          status: 400,
-          detail: 'Query parameters contain invalid values.',
-          fieldErrors: {
-            cursor: err.message,
-          },
-        });
-      }
-      throw err;
-    }
-
-    res.json({
-      data: result.data,
-      meta: result.meta,
-      message: 'Invoices retrieved successfully.',
-    });
-  });
-
-  // Invoices — POST (create) with strict payload validation and 512 KB body limit
-  app.post('/api/invoices', ...invoiceBodyLimit(), (req, res) => {
-    const result = invoiceCreateSchema.safeParse(req.body);
-
-    if (!result.success) {
-      const fieldErrors = parseValidationErrors(result.error);
-      return res.status(400).json({
-        type: 'https://liquifact.io/problems/validation-error',
-        title: 'Validation Error',
-        status: 400,
-        detail: 'Invoice payload contains invalid or missing fields.',
-        fieldErrors,
-      });
-    }
-
-    res.status(201).json({
-      data: { id: 'placeholder', status: 'pending_verification' },
-      message: 'Invoice upload will be implemented with verification and tokenization.',
-    });
-  });
-
-  // Escrow — GET by invoiceId (proxied through Soroban retry wrapper with address mapping)
-  // Compression middleware: gzip/deflate for large escrow-read responses (issue #961).
-  // Threshold: 1 KB (DEFAULT_THRESHOLD). Respects Accept-Encoding; small responses
-  // pass through uncompressed. Vary: Accept-Encoding is always set.
-  //
-  // Validation order:
-  //   1. validateEscrowParamsMiddleware — allowlist + length bound on :invoiceId (400 on failure)
-  //   2. createCompressionMiddleware()  — content-encoding negotiation
-  //   3. handler                        — uses req.validatedParams.invoiceId (schema-safe value)
-  app.get('/api/escrow/:invoiceId', validateEscrowParamsMiddleware, createCompressionMiddleware(), async (req, res, next) => {
-    // Use the schema-validated param; fall back to raw only during unit-test
-    // scenarios where the middleware was bypassed explicitly.
-    const invoiceId = req.validatedParams
-      ? req.validatedParams.invoiceId
-      : String(req.params.invoiceId || '').trim().replace(/\s+/g, '');
-
-    const { result, escrowAddress, error, code, statusCode } = await getEscrowRead(invoiceId);
-
-    if (error) {
-      return res.status(statusCode).json({ error, code });
-    }
-
-    res.set('X-Escrow-Address', escrowAddress);
-    return res.json({
-      ...responseHelper.success(result),
-      message: result && result.fromProjection
-        ? 'Escrow state read from event projection.'
-        : 'Escrow state read from live Soroban contract.',
-    });
-  });
-
-  /**
-   * Simulated error route for testing error handling middleware.
-   *
-   * @param {import('express').Request} req Express request.
-   * @param {import('express').Response} res Express response.
-   * @param {import('express').NextFunction} next Express next callback.
-   * @returns {void}
-   */
-  app.get('/error', (req, res, next) => {
-    next(new Error('Simulated server error'));
-  });
-
-  app.get('/debug/error', (req, res, next) => {
-    next(new Error('Triggered Error'));
-  });
-
-  app.get('/prod-error', (req, res, next) => {
-    next(new Error('Sensitive'));
-  });
-
-  /**
-   * Feature router mounts — order is intentional.
-   *
-   * Each router is imported once and mounted once via `mountFeatureRouter`.
-   * Multiple routers may share a base path only when they are distinct instances
-   * (e.g. invoice file upload + invoice state machine both use `/api/invoices`).
-   * The investor router (`/api/investor`) must never be mounted twice; duplicate
-   * mounts are rejected at bootstrap by `assertNoDuplicateRouterMounts`.
-   *
-   * Investor handlers apply `authenticateToken` then `extractTenant` before
-   * lock list or detail logic runs (see `routes/investor.js`).
-   *
-   * @see docs/request-lifecycle-middleware-order.md
-   */
-  mountFeatureRouter(app, '/api/sme', smeRoutes);
-  mountFeatureRouter(app, '/api/invoices', invoiceFileRoutes);
-  if (getConfig().INVOICE_STATE_ENABLED === 'true') {
-    mountFeatureRouter(app, '/api/invoices', invoiceStateRoutes);
-  }
-  mountFeatureRouter(app, '/api/invest', investRoutes);
-  mountFeatureRouter(app, '/api/investor', investorRoutes);
-  mountFeatureRouter(app, '/api/kyc', kycRoutes);
-  mountFeatureRouter(app, '/api/marketplace', marketplaceRoutes);
-  mountFeatureRouter(app, '/api/health', healthRoutes);
-  mountFeatureRouter(app, '/api/retention', retentionRoutes);
-  mountFeatureRouter(app, '/api/admin/audit', auditTrailRoutes);
-  mountFeatureRouter(app, '/api/admin/escrow', adminEscrowRoutes);
-  mountFeatureRouter(app, '/api/admin/escrow-read', adminEscrowReadRoutes);
-  mountFeatureRouter(app, '/api/admin/webhooks', adminWebhooksRoutes);
-  if (getConfig().CONFIG_RUNTIME_ENABLED === 'true') {
-    mountFeatureRouter(app, '/api/admin/config', adminConfigRoutes);
-  }
-  mountFeatureRouter(app, '/api/admin/reconciliation', reconciliationRoutes);
-  if (getConfig().ESCROW_INDEXER_ENABLED === 'true') {
-    mountFeatureRouter(app, '/api/admin/indexer', adminIndexerRoutes);
-  }
-  mountFeatureRouter(app, '/api/admin/metrics', adminMetricsRoutes);
-  mountFeatureRouter(app, '/api/admin/kyc', adminKycRoutes);
-  mountFeatureRouter(app, '/v1', v1Routes);
-  mountFeatureRouter(app, '/api', apiKeysRoutes);
-
-  assertNoDuplicateRouterMounts(app);
-
-  // ── 6. Prometheus metrics ────────────────────────────────────────────────
-  // Rate limiter mounted BEFORE metricsAuth so unauthenticated attempts
-  // still consume quota — defending against brute-force token guessing
-  // on the metrics surface (issue #744).
-  app.get('/metrics', metricsLimiter, metricsAuth, metricsHandler);
-
-  // ── 7. 404 catch-all ─────────────────────────────────────────────────────
-  app.use((req, res) => {
-    res.status(404).json({ error: 'Not found', path: req.path });
-  });
-
-  // ── 8 – 10. Error handlers (order matters) ───────────────────────────────
-  app.use(handleCorsError);
-  app.use(payloadTooLargeHandler);
-  app.use(configErrorHandler);
-  app.use(handleInternalError);
-
-  return app;
+function baseUrl(req) {
+  return process.env.PUBLIC_API_BASE_URL || `${req.protocol}://${req.get('host')}`;
 }
 
-/**
- * Maps HTTP status to default API error code.
- *
- * @param {number} statusCode - HTTP status code.
- * @returns {string} Standardized error code.
- */
-function getErrorCode(statusCode) {
-  if (statusCode === 400) {
-    return 'BAD_REQUEST';
-  }
-  if (statusCode === 401) {
-    return 'UNAUTHORIZED';
-  }
-  if (statusCode === 403) {
-    return 'FORBIDDEN';
-  }
-  if (statusCode === 404) {
-    return 'NOT_FOUND';
-  }
-  return 'INTERNAL_ERROR';
-}
+const ENDPOINTS = [
+  { method: 'GET', path: '/', description: 'This index' },
+  { method: 'GET', path: '/health', description: 'Liveness probe' },
+  { method: 'GET', path: '/docs', description: 'Interactive API docs (Swagger UI)' },
+  { method: 'GET', path: '/openapi.json', description: 'OpenAPI 3 document' },
+  { method: 'GET', path: '/api/stats', description: 'Marketplace totals' },
+  { method: 'GET', path: '/api/invoices', description: 'List invoices (?status=open|funded|settled|cancelled)' },
+  { method: 'GET', path: '/api/invoices/:id', description: 'Get one invoice' },
+  { method: 'POST', path: '/api/invoices', description: 'Submit an invoice for financing' },
+  { method: 'POST', path: '/api/invoices/:id/fund', description: 'Record an investor contribution' },
+  { method: 'GET', path: '/api/escrow', description: 'Deployed Soroban escrow contract metadata' },
+  { method: 'GET', path: '/api/escrow/live', description: 'Live escrow state from Soroban RPC' },
+];
 
-/**
- * Builds a standardized envelope from an outgoing JSON payload.
- *
- * @param {number} statusCode - Response status code.
- * @param {unknown} payload - Outgoing payload.
- * @returns {Object} Standardized response envelope.
- */
-function toStandardEnvelope(statusCode, payload) {
-  const isDev = process.env.NODE_ENV === 'development';
-  const isObjectPayload = payload !== null && typeof payload === 'object';
-
-  if (
-    isObjectPayload &&
-    Object.prototype.hasOwnProperty.call(payload, 'data') &&
-    Object.prototype.hasOwnProperty.call(payload, 'meta') &&
-    Object.prototype.hasOwnProperty.call(payload, 'error')
-  ) {
-    return payload;
-  }
-
-  if (statusCode < 400) {
-    const data =
-      isObjectPayload && Object.prototype.hasOwnProperty.call(payload, 'data')
-        ? payload.data
-        : payload;
-    return responseHelper.success(data);
-  }
-
-  const payloadError =
-    isObjectPayload && Object.prototype.hasOwnProperty.call(payload, 'error')
-      ? payload.error
-      : null;
-
-  let message = 'Internal server error';
-  if (typeof payloadError === 'string') {
-    message = payloadError;
-  } else if (payloadError && typeof payloadError.message === 'string') {
-    message = payloadError.message;
-  } else if (isObjectPayload && typeof payload.message === 'string') {
-    message = payload.message;
-  }
-
-  if (statusCode >= 500 && !isDev) {
-    message = 'Internal server error';
-  }
-
-  const details = isDev
-    ? (payloadError && payloadError.stack) ||
-      (payloadError && payloadError.details) ||
-      (isObjectPayload && payload.stack) ||
-      (isObjectPayload && payload.message) ||
-      message
-    : null;
-
-  return responseHelper.error(message, getErrorCode(statusCode), details);
-}
-
-/**
- * Creates app instance that always returns standardized response envelopes.
- *
- * @returns {import('express').Express} Standardized app instance.
- */
-function createStandardizedApp() {
-  const standardizedApp = express();
-  const rawApp = createApp();
-
-  standardizedApp.use((req, res, next) => {
-    const originalJson = res.json.bind(res);
-    /**
-     * Wraps outgoing JSON payloads in the standard response envelope.
-     *
-     * @param {unknown} payload - Outgoing JSON payload.
-     * @returns {import('express').Response} Express response.
-     */
-    res.json = function sendEnvelopedJson(payload) {
-      const envelope = toStandardEnvelope(res.statusCode, payload);
-      return originalJson(envelope);
-    };
-    next();
+app.get('/', (req, res) => {
+  res.json({
+    name: 'LiquiFact API',
+    description: 'Invoice liquidity network on Stellar',
+    version: config.version,
+    docs: `${baseUrl(req)}/docs`,
+    openapi: `${baseUrl(req)}/openapi.json`,
+    frontend: config.frontendUrl,
+    contract: { id: config.contractId, network: config.network, explorer: config.explorerUrl },
+    endpoints: ENDPOINTS,
   });
+});
 
-  standardizedApp.use(rawApp);
-  return standardizedApp;
-}
+const health = (req, res) =>
+  res.json({ status: 'ok', service: 'liquifact-api', version: config.version, timestamp: new Date().toISOString() });
+app.get('/health', health);
+app.get('/healthz', health);
 
-const app = createStandardizedApp();
+app.get('/openapi.json', (req, res) => res.json(buildSpec(baseUrl(req))));
+
+const SWAGGER = 'https://unpkg.com/swagger-ui-dist@5.17.14';
+app.get('/docs', (req, res) => {
+  res.type('html').send(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LiquiFact API Docs</title><link rel="stylesheet" href="${SWAGGER}/swagger-ui.css">
+<style>body{margin:0;background:#fafafa}.lf-bar{background:#0b1020;color:#fff;padding:14px 20px;font:600 16px system-ui}
+.lf-bar a{color:#7dd3fc;margin-left:16px;font-weight:400;text-decoration:none}</style></head>
+<body><div class="lf-bar">LiquiFact API<a href="/">Index</a><a href="/openapi.json">openapi.json</a>
+<a href="${config.frontendUrl}">Website</a><a href="${config.explorerUrl}">Escrow contract</a></div>
+<div id="swagger-ui"></div><script src="${SWAGGER}/swagger-ui-bundle.js"></script><script src="/docs/init.js"></script></body></html>`);
+});
+app.get('/docs/init.js', (req, res) => {
+  res.type('application/javascript').send("window.ui=SwaggerUIBundle({url:'/openapi.json',dom_id:'#swagger-ui'});");
+});
+
+app.get('/api/stats', (req, res) => {
+  const all = store.list();
+  const sum = (arr, k) => arr.reduce((acc, i) => acc + i[k], 0);
+  res.json({
+    invoices: all.length,
+    open: all.filter((i) => i.status === 'open').length,
+    totalFaceValue: sum(all, 'amount'),
+    totalFunded: sum(all, 'fundedAmount'),
+    averageYieldBps: all.length ? Math.round(sum(all, 'yieldBps') / all.length) : 0,
+  });
+});
+
+app.use('/api/invoices', require('./routes/invoices'));
+app.use('/api/escrow', require('./routes/escrow'));
+
+app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.path, docs: '/docs' }));
+
+app.use((err, req, res, _next) => {
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({ error: status === 500 ? 'Internal server error' : err.message });
+});
 
 module.exports = app;
-module.exports.createApp = createApp;
-module.exports.createStandardizedApp = createStandardizedApp;
-module.exports.handleCorsError = handleCorsError;
-module.exports.handleInternalError = handleInternalError;
