@@ -20,6 +20,53 @@ const Invoice = {
   },
 };
 
+const EscrowState = {
+  type: 'object',
+  properties: {
+    invoice_id: { type: 'string' },
+    admin: { type: 'string' },
+    sme_address: { type: 'string' },
+    amount: { type: 'string' },
+    funding_target: { type: 'string' },
+    funded_amount: { type: 'string' },
+    yield_bps: { type: 'integer' },
+    maturity: { type: 'integer' },
+    status: { type: 'integer' },
+  },
+};
+
+const CacheMeta = {
+  type: 'object',
+  required: ['status', 'ageMs', 'fetchedAt'],
+  properties: {
+    status: { type: 'string', enum: ['hit', 'miss', 'stale'] },
+    ageMs: { type: 'integer', minimum: 0 },
+    fetchedAt: { type: 'string', format: 'date-time' },
+  },
+};
+
+const EscrowLiveResponse = {
+  type: 'object',
+  required: ['source', 'contractId', 'escrow', 'cache'],
+  properties: {
+    source: { type: 'string', enum: ['soroban-rpc'] },
+    contractId: { type: 'string' },
+    escrow: EscrowState,
+    cache: CacheMeta,
+  },
+};
+
+const EscrowSnapshotResponse = {
+  type: 'object',
+  required: ['source', 'contractId', 'escrow', 'warning'],
+  properties: {
+    source: { type: 'string', enum: ['snapshot'] },
+    contractId: { type: 'string' },
+    warning: { type: 'string' },
+    escrow: EscrowState,
+  },
+};
+
 const json = (schema) => ({ content: { 'application/json': { schema } } });
 const ErrorBody = { type: 'object', properties: { error: { type: 'string' } } };
 
@@ -37,7 +84,7 @@ function buildSpec(baseUrl) {
       version: config.version,
       description:
         'Invoice liquidity network on Stellar. SMEs tokenize invoices, investors fund them, and a Soroban escrow ' +
-        `contract holds funds until settlement. Escrow contract (testnet): ${config.contractId}`,
+        'holds funds until settlement. Escrow contract (testnet): ' + config.contractId,
     },
     servers: [{ url: baseUrl }],
     tags: [{ name: 'System' }, { name: 'Invoices' }, { name: 'Escrow' }],
@@ -120,12 +167,31 @@ function buildSpec(baseUrl) {
       '/api/escrow/live': {
         get: {
           tags: ['Escrow'],
-          summary: 'Live escrow state read from Soroban RPC (falls back to deploy snapshot)',
-          responses: { 200: { description: 'Escrow state' } },
+          summary: 'Live escrow state read from Soroban RPC (cached, falls back to deploy snapshot)',
+          description:
+            'Served from a small in-process TTL cache with single-flight and stale-while-revalidate. ' +
+            'The `cache.status` is `miss` on the first load, `hit` within the TTL, and `stale` while ' +
+            'a background refresh is in flight. Use `?fresh=1` to bypass the cache (still single-flighted).',
+          parameters: [
+            {
+              name: 'fresh',
+              in: 'query',
+              required: false,
+              schema: { type: 'string', enum: ['1', 'true'] },
+              description: 'Bypass the cache and force a reload (still single-flighted).',
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Live escrow state (or snapshot fallback)',
+              ...json({ type: 'object', oneOf: [EscrowLiveResponse, EscrowSnapshotResponse] }),
+            },
+            304: { description: 'Not Modified (ETag match)' },
+          },
         },
       },
     },
   };
 }
 
-module.exports = { buildSpec };
+module.exports = { buildSpec, EscrowLiveResponse, EscrowSnapshotResponse, CacheMeta };
