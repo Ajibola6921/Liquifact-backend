@@ -87,7 +87,7 @@ function buildSpec(baseUrl) {
         'holds funds until settlement. Escrow contract (testnet): ' + config.contractId,
     },
     servers: [{ url: baseUrl }],
-    tags: [{ name: 'System' }, { name: 'Invoices' }, { name: 'Escrow' }],
+    tags: [{ name: 'System' }, { name: 'Invoices' }, { name: 'Investors' }, { name: 'Escrow' }],
     paths: {
       '/health': {
         get: {
@@ -97,7 +97,58 @@ function buildSpec(baseUrl) {
         },
       },
       '/api/stats': {
-        get: { tags: ['System'], summary: 'Marketplace totals', responses: { 200: { description: 'Totals' } } },
+        get: {
+          tags: ['System'],
+          summary: 'Marketplace statistics grouped by asset (no FX conversion)',
+          parameters: [{ name: 'currency', in: 'query', schema: { type: 'string', pattern: '^[a-zA-Z0-9]{1,12}$' }, description: 'Exact asset code; an unknown valid code returns empty statistics. Repeated values are rejected.' }],
+          responses: {
+            200: {
+              description: 'Statistics for the selected currency, or all currencies',
+              ...json({
+                type: 'object',
+                required: ['invoices', 'open', 'byStatus', 'byCurrency', 'generatedAt', 'deprecated'],
+                properties: {
+                  invoices: { type: 'integer', minimum: 0 },
+                  open: { type: 'integer', minimum: 0 },
+                  byStatus: {
+                    type: 'object',
+                    required: ['open', 'funded', 'settled', 'cancelled'],
+                    properties: Object.fromEntries(['open', 'funded', 'settled', 'cancelled'].map((key) => [key, { type: 'integer', minimum: 0 }])),
+                  },
+                  byCurrency: {
+                    type: 'object',
+                    additionalProperties: {
+                      type: 'object',
+                      required: ['invoices', 'faceValue', 'funded', 'outstanding', 'weightedYieldBps'],
+                      properties: {
+                        invoices: { type: 'integer', minimum: 0, description: 'Includes cancelled invoices in this currency' },
+                        faceValue: { type: 'string', pattern: '^\\d+(\\.\\d+)?$', description: 'Non-cancelled principal, as a decimal string' },
+                        funded: { type: 'string', pattern: '^\\d+(\\.\\d+)?$', description: 'Non-cancelled funded principal' },
+                        outstanding: { type: 'string', pattern: '^\\d+(\\.\\d+)?$', description: 'Funded principal of invoices currently in funded status' },
+                        weightedYieldBps: { type: 'integer', minimum: 0, maximum: 10000, description: 'Principal-weighted, rounded basis points; zero for zero principal' },
+                      },
+                    },
+                  },
+                  generatedAt: { type: 'string', format: 'date-time' },
+                  totalFaceValue: { type: 'number', deprecated: true, description: 'Compatibility alias of deprecated.totalFaceValue for one release only' },
+                  totalFunded: { type: 'number', deprecated: true, description: 'Compatibility alias of deprecated.totalFunded for one release only' },
+                  averageYieldBps: { type: 'number', deprecated: true, description: 'Compatibility alias of deprecated.averageYieldBps for one release only' },
+                  deprecated: {
+                    type: 'object', deprecated: true,
+                    description: 'Legacy mixed-currency calculations retained here for one release only. Not meaningful financial totals.',
+                    required: ['totalFaceValue', 'totalFunded', 'averageYieldBps'],
+                    properties: {
+                      totalFaceValue: { type: 'number', deprecated: true },
+                      totalFunded: { type: 'number', deprecated: true },
+                      averageYieldBps: { type: 'number', deprecated: true },
+                    },
+                  },
+                },
+              }),
+            },
+            400: { description: 'Invalid or repeated currency', ...json({ type: 'object', required: ['error', 'code', 'details'], properties: { error: { type: 'string' }, code: { type: 'string', enum: ['VALIDATION_FAILED'] }, details: { type: 'object', properties: { currency: { type: 'string' } } } } }) },
+          },
+        },
       },
       '/api/invoices': {
         get: {
@@ -152,12 +203,111 @@ function buildSpec(baseUrl) {
           tags: ['Invoices'],
           summary: 'Record an investor contribution (demo, off-chain)',
           parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
-          requestBody: { required: true, ...json({ type: 'object', properties: { amount: { type: 'number' } } }) },
+          requestBody: {
+            required: true,
+            ...json({
+              type: 'object',
+              required: ['amount', 'investor'],
+              properties: {
+                amount: { type: 'number', example: 1000 },
+                investor: { type: 'string', example: 'GA7TXEBMEPQCLHIYCWDN7RKAO5IMRD2UV7O7TZXMEW6VZUMEXNR4XBB5' },
+              },
+            }),
+          },
           responses: {
-            200: { description: 'Updated invoice' },
-            400: { description: 'Invalid amount' },
-            404: { description: 'Not found' },
-            409: { description: 'Invoice not open' },
+            200: { description: 'Updated invoice', ...json({ type: 'object', properties: { data: Invoice } }) },
+            400: { description: 'Invalid amount or missing/invalid investor', ...json(ErrorBody) },
+            404: { description: 'Not found', ...json(ErrorBody) },
+            409: { description: 'Invoice not open', ...json(ErrorBody) },
+            422: { description: 'Self-funding not allowed', ...json(ErrorBody) },
+          },
+        },
+      },
+      '/api/invoices/{id}/contributions': {
+        get: {
+          tags: ['Invoices'],
+          summary: 'List contributions for an invoice',
+          parameters: [
+            { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 100, default: 50 } },
+            { name: 'cursor', in: 'query', schema: { type: 'string' } },
+          ],
+          responses: {
+            200: {
+              description: 'Contributions and totals',
+              ...json({
+                type: 'object',
+                properties: {
+                  data: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        investor: { type: 'string' },
+                        amount: { type: 'number' },
+                        createdAt: { type: 'string', format: 'date-time' },
+                      },
+                    },
+                  },
+                  totals: {
+                    type: 'object',
+                    properties: {
+                      funded: { type: 'number' },
+                      investors: { type: 'integer' },
+                    },
+                  },
+                  nextCursor: { type: 'string' },
+                },
+              }),
+            },
+            400: { description: 'Invalid limit or cursor', ...json(ErrorBody) },
+            404: { description: 'Not found', ...json(ErrorBody) },
+          },
+        },
+      },
+      '/api/investors/{address}/portfolio': {
+        get: {
+          tags: ['Investors'],
+          summary: 'Investor portfolio summary and expected returns',
+          parameters: [{ name: 'address', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            200: {
+              description: 'Investor portfolio',
+              ...json({
+                type: 'object',
+                properties: {
+                  investor: { type: 'string' },
+                  positions: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        invoiceId: { type: 'string' },
+                        status: { type: 'string', enum: ['open', 'funded', 'settled', 'cancelled'] },
+                        currency: { type: 'string' },
+                        principal: { type: 'number' },
+                        yieldBps: { type: 'integer' },
+                        dueDate: { type: 'string', format: 'date' },
+                        expectedCoupon: { oneOf: [{ type: 'number' }, { type: 'string' }] },
+                        expectedPayout: { type: 'number' },
+                      },
+                    },
+                  },
+                  totalsByCurrency: {
+                    type: 'object',
+                    additionalProperties: {
+                      type: 'object',
+                      properties: {
+                        principal: { type: 'number' },
+                        expectedCoupon: { type: 'number' },
+                        expectedPayout: { type: 'number' },
+                      },
+                    },
+                  },
+                },
+              }),
+            },
+            400: { description: 'Invalid investor address', ...json(ErrorBody) },
           },
         },
       },
@@ -187,6 +337,143 @@ function buildSpec(baseUrl) {
               ...json({ type: 'object', oneOf: [EscrowLiveResponse, EscrowSnapshotResponse] }),
             },
             304: { description: 'Not Modified (ETag match)' },
+          },
+        },
+      },
+      '/api/escrow/attestations': {
+        get: {
+          tags: ['Escrow'],
+          summary: 'On-chain attestation log (paginated)',
+          description:
+            'Returns the primary attestation hash and a page of the append-only attestation log. ' +
+            'Page size is capped at 20 (MAX_ATTESTATION_READ_PAGE). Use `nextCursor` to fetch subsequent pages.',
+          parameters: [
+            {
+              name: 'cursor',
+              in: 'query',
+              description: 'Zero-based start index for the log page (default: 0)',
+              schema: { type: 'integer', minimum: 0, default: 0 },
+            },
+            {
+              name: 'limit',
+              in: 'query',
+              description: 'Number of log entries to return (1–20, default: 20)',
+              schema: { type: 'integer', minimum: 1, maximum: 20, default: 20 },
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Attestation state',
+              ...json({
+                type: 'object',
+                properties: {
+                  primary: {
+                    type: 'string',
+                    nullable: true,
+                    description: 'Lowercase hex SHA-256 of the primary attestation, or null if not set',
+                    example: 'a'.repeat(64),
+                  },
+                  log: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        index: { type: 'integer', description: 'Zero-based position in the append log' },
+                        digest: { type: 'string', description: 'Lowercase 64-char hex SHA-256' },
+                        revoked: { type: 'boolean' },
+                      },
+                      required: ['index', 'digest', 'revoked'],
+                    },
+                  },
+                  total: {
+                    type: 'integer',
+                    nullable: true,
+                    description: 'Total number of log entries, or null if unavailable',
+                  },
+                  nextCursor: {
+                    type: 'integer',
+                    nullable: true,
+                    description: 'Start index for the next page, or null if this is the last page',
+                  },
+                },
+                required: ['primary', 'log', 'total', 'nextCursor'],
+              }),
+            },
+            400: { description: 'Invalid cursor or limit', ...json(ErrorBody) },
+            502: { description: 'Soroban RPC read failed', ...json(ErrorBody) },
+          },
+        },
+      },
+      '/api/escrow/attestations/verify': {
+        post: {
+          tags: ['Escrow'],
+          summary: 'Verify a document digest against on-chain attestations',
+          description:
+            'Accepts either a JSON body `{ sha256: "<64 hex>" }` or a `multipart/form-data` upload ' +
+            '(file ≤ 5 MiB, hashed with SHA-256 while streaming — the file is never stored). ' +
+            'Returns whether the digest matches the primary hash or a non-revoked log entry.',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  required: ['sha256'],
+                  properties: {
+                    sha256: {
+                      type: 'string',
+                      description: '64-character hex SHA-256 digest to verify',
+                      example: 'a'.repeat(64),
+                    },
+                  },
+                },
+              },
+              'multipart/form-data': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    file: {
+                      type: 'string',
+                      format: 'binary',
+                      description: 'Document file (≤ 5 MiB). The server hashes it with SHA-256 and discards the bytes.',
+                    },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Verification result',
+              ...json({
+                type: 'object',
+                properties: {
+                  sha256: { type: 'string', description: 'The digest that was checked (normalised to lowercase)' },
+                  match: {
+                    type: 'string',
+                    enum: ['primary', 'log', 'none'],
+                    description: '"primary" if it matches the primary hash, "log" if found in the append log, "none" otherwise',
+                  },
+                  index: {
+                    type: 'integer',
+                    nullable: true,
+                    description: 'Zero-based log index when match is "log"; omitted otherwise',
+                  },
+                  revoked: {
+                    type: 'boolean',
+                    description: 'true if the matched log entry has been revoked',
+                  },
+                  verified: {
+                    type: 'boolean',
+                    description: 'true when match !== "none" && !revoked',
+                  },
+                },
+                required: ['sha256', 'match', 'revoked', 'verified'],
+              }),
+            },
+            400: { description: 'Invalid or missing digest (INVALID_DIGEST / NO_FILE)', ...json(ErrorBody) },
+            413: { description: 'Uploaded file exceeds 5 MiB', ...json(ErrorBody) },
+            502: { description: 'Soroban RPC read failed', ...json(ErrorBody) },
           },
         },
       },
