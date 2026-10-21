@@ -5,7 +5,7 @@
  * zero setup (locally, in CI and on Vercel).
  */
 const CONTRACT_ID =
-  process.env.ESCROW_CONTRACT_ID || 'CDQCKR2YU6IVQ4VQPBMXBPZ4FGFQB5H25AI7ZSETHS2CZ5ZRCWQDSO6P';
+  process.env.ESCROW_CONTRACT_ID || 'CDQCKR2YU6IVQ4GYPBMXBPZ4FGFQB5H25AI7ZSETHS2CZ5ZRCWQDSO6P';
 
 // Maximum time (ms) to poll for a transaction's final status when the client
 // requests `?wait=true`. Capped to stay within Vercel's function limits.
