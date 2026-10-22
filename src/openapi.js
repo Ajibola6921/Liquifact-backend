@@ -20,21 +20,6 @@ const Invoice = {
   },
 };
 
-const EscrowState = {
-  type: 'object',
-  properties: {
-    invoice_id: { type: 'string' },
-    admin: { type: 'string' },
-    sme_address: { type: 'string' },
-    amount: { type: 'string' },
-    funding_target: { type: 'string' },
-    funded_amount: { type: 'string' },
-    yield_bps: { type: 'integer' },
-    maturity: { type: 'integer' },
-    status: { type: 'integer' },
-  },
-};
-
 const CacheMeta = {
   type: 'object',
   required: ['status', 'ageMs', 'fetchedAt'],
@@ -45,14 +30,76 @@ const CacheMeta = {
   },
 };
 
+const json = (schema) => ({ content: { 'application/json': { schema } } });
+const ErrorBody = { type: 'object', properties: { error: { type: 'string' } } };
+
+/** Raw stroop amount as a decimal integer string (7 decimals). */
+const StroopString = { type: 'string', pattern: '^\\d+$', example: '1000000000' };
+
+/** Amount converted to whole units with a fixed 7 decimal places. */
+const DecimalString = { type: 'string', pattern: '^\\d+\\.\\d{7}$', example: '100.0000000' };
+
+/**
+ * Typed escrow state returned identically by the live (Soroban RPC) and
+ * snapshot read paths.
+ */
+const EscrowState = {
+  type: 'object',
+  required: [
+    'invoiceId',
+    'admin',
+    'smeAddress',
+    'amount',
+    'fundingTarget',
+    'fundedAmount',
+    'amountDecimal',
+    'fundingTargetDecimal',
+    'fundedAmountDecimal',
+    'yieldBps',
+    'maturity',
+    'maturityIso',
+    'status',
+    'statusCode',
+  ],
+  properties: {
+    invoiceId: { type: 'string', example: 'INV_0001' },
+    admin: { type: 'string', example: 'GA7TXEBMEPQCLHIYCWDN7RKAO5IMRD2UV7O7TZXMEW6VZUMEXNR4XBB5' },
+    smeAddress: { type: 'string', example: 'GA7TXEBMEPQCLHIYCWDN7RKAO5IMRD2UV7O7TZXMEW6VZUMEXNR4XBB5' },
+    amount: { ...StroopString, description: 'Raw amount in stroops (7 decimals)' },
+    fundingTarget: { ...StroopString, description: 'Raw funding target in stroops' },
+    fundedAmount: { ...StroopString, description: 'Raw funded amount in stroops' },
+    amountDecimal: { ...DecimalString, description: 'Amount as a fixed 7-decimal string' },
+    fundingTargetDecimal: { ...DecimalString, description: 'Funding target as a fixed 7-decimal string' },
+    fundedAmountDecimal: { ...DecimalString, description: 'Funded amount as a fixed 7-decimal string' },
+    yieldBps: { type: 'integer', minimum: 0, maximum: 10000, example: 800 },
+    maturity: { type: 'integer', minimum: 0, description: 'Maturity as unix seconds', example: 1800132005 },
+    maturityIso: { type: 'string', format: 'date-time', example: '2027-01-17T00:13:25.000Z' },
+    status: {
+      type: 'string',
+      enum: ['open', 'funded', 'settled', 'withdrawn', 'cancelled', 'unknown'],
+      description: 'Human-readable status; unknown contract codes map to "unknown"',
+    },
+    statusCode: { type: 'integer', minimum: 0, description: 'Raw contract status code (0 open, 1 funded, 2 settled, 3 withdrawn, 4 cancelled)' },
+  },
+};
+
+/** Response of GET /api/escrow/live. */
 const EscrowLiveResponse = {
   type: 'object',
-  required: ['source', 'contractId', 'escrow', 'cache'],
+  required: ['source', 'contractId', 'network', 'escrow'],
   properties: {
-    source: { type: 'string', enum: ['soroban-rpc'] },
+    source: { type: 'string', enum: ['soroban-rpc', 'snapshot'], description: 'Where the payload came from' },
     contractId: { type: 'string' },
-    escrow: EscrowState,
-    cache: CacheMeta,
+    network: { type: 'string', example: 'testnet' },
+    escrow: { $ref: '#/components/schemas/EscrowState' },
+    latestLedger: { type: 'integer', description: 'Ledger the live read came from (present only when source is soroban-rpc)' },
+    snapshotCapturedAt: { type: 'string', format: 'date-time', description: 'When the fallback snapshot was captured (present only when source is snapshot)' },
+    warning: {
+      type: 'object',
+      required: ['code'],
+      description: 'Present only when the live read failed and the snapshot was served',
+      properties: { code: { type: 'string', enum: ['LIVE_READ_FAILED'] } },
+    },
   },
 };
 
@@ -66,9 +113,6 @@ const EscrowSnapshotResponse = {
     escrow: EscrowState,
   },
 };
-
-const json = (schema) => ({ content: { 'application/json': { schema } } });
-const ErrorBody = { type: 'object', properties: { error: { type: 'string' } } };
 
 /**
  * Builds the OpenAPI document for the given public base URL.
@@ -88,6 +132,12 @@ function buildSpec(baseUrl) {
     },
     servers: [{ url: baseUrl }],
     tags: [{ name: 'System' }, { name: 'Invoices' }, { name: 'Investors' }, { name: 'Escrow' }],
+    components: {
+      schemas: {
+        EscrowState,
+        EscrowLiveResponse,
+      },
+    },
     paths: {
       '/health': {
         get: {
@@ -195,6 +245,38 @@ function buildSpec(baseUrl) {
           responses: {
             200: { description: 'Invoice', ...json({ type: 'object', properties: { data: Invoice } }) },
             404: { description: 'Not found', ...json(ErrorBody) },
+          },
+        },
+      },
+      '/api/invoices/{id}/quote': {
+        get: {
+          tags: ['Invoices'],
+          summary: 'Quote an investment contribution and annualised returns',
+          description: 'Coupon uses floor(principal minor units × yieldBps / 10,000), matching escrow. The protocol fee is shown separately and is deducted from SME withdrawal on-chain, so it is not subtracted from investor payout. Effective annualisation uses floating-point arithmetic solely as a comparison metric.',
+          parameters: [
+            { name: 'id', in: 'path', required: true, schema: { type: 'string' } },
+            { name: 'amount', in: 'query', required: true, description: 'Positive decimal contribution, with at most 7 fractional digits', schema: { type: 'string', pattern: '^(?:0|[1-9]\\d*)(?:\\.\\d{1,7})?$' } },
+            { name: 'asOf', in: 'query', required: false, description: 'Valuation date in UTC; defaults to today UTC', schema: { type: 'string', format: 'date' } },
+          ],
+          responses: {
+            200: { description: 'Investment quote; monetary values are decimal strings', ...json({
+              type: 'object',
+              required: ['invoiceId', 'currency', 'principal', 'yieldBps', 'coupon', 'payout', 'protocolFeeBps', 'daysToMaturity', 'simpleAnnualisedBps', 'effectiveAnnualisedBps', 'maturity', 'asOf'],
+              properties: {
+                invoiceId: { type: 'string' }, currency: { type: 'string' },
+                principal: { type: 'string', pattern: '^\\d+(?:\\.\\d{1,7})?$' },
+                yieldBps: { type: 'integer', minimum: 0, maximum: 10000 },
+                coupon: { type: 'string', pattern: '^\\d+(?:\\.\\d{1,7})?$' },
+                payout: { type: 'string', pattern: '^\\d+(?:\\.\\d{1,7})?$' },
+                protocolFeeBps: { type: 'integer', minimum: 0 }, daysToMaturity: { type: 'integer', minimum: 1 },
+                simpleAnnualisedBps: { type: 'integer', minimum: 0 }, effectiveAnnualisedBps: { type: 'integer', minimum: 0 },
+                maturity: { type: 'string', format: 'date' }, asOf: { type: 'string', format: 'date' },
+              },
+            }) },
+            400: { description: 'Invalid amount or asOf', ...json({ type: 'object', required: ['error', 'code'], properties: { error: { type: 'string' }, code: { type: 'string', enum: ['INVALID_AMOUNT', 'INVALID_AS_OF'] } } }) },
+            404: { description: 'Unknown invoice', ...json({ type: 'object', required: ['error', 'code'], properties: { error: { type: 'string' }, code: { type: 'string', enum: ['INVOICE_NOT_FOUND'] } } }) },
+            409: { description: 'Invoice is not open or has matured', ...json({ type: 'object', required: ['error', 'code'], properties: { error: { type: 'string' }, code: { type: 'string', enum: ['INVOICE_NOT_OPEN', 'INVOICE_MATURED'] } } }) },
+            422: { description: 'Contribution exceeds remaining capacity', ...json({ type: 'object', required: ['error', 'code'], properties: { error: { type: 'string' }, code: { type: 'string', enum: ['EXCEEDS_CAPACITY'] } } }) },
           },
         },
       },
@@ -312,7 +394,27 @@ function buildSpec(baseUrl) {
         },
       },
       '/api/escrow': {
-        get: { tags: ['Escrow'], summary: 'Deployed escrow contract metadata', responses: { 200: { description: 'Contract info' } } },
+        get: {
+          tags: ['Escrow'],
+          summary: 'Deployed escrow contract metadata (decoded deploy snapshot)',
+          responses: {
+            200: {
+              description: 'Contract info with the deploy snapshot decoded as EscrowState',
+              ...json({
+                type: 'object',
+                required: ['contractId', 'network', 'snapshot'],
+                properties: {
+                  contractId: { type: 'string' },
+                  network: { type: 'string' },
+                  rpcUrl: { type: 'string' },
+                  explorer: { type: 'string' },
+                  snapshot: { $ref: '#/components/schemas/EscrowState' },
+                  snapshotCapturedAt: { type: 'string', format: 'date-time' },
+                },
+              }),
+            },
+          },
+        },
       },
       '/api/escrow/live': {
         get: {
@@ -321,7 +423,9 @@ function buildSpec(baseUrl) {
           description:
             'Served from a small in-process TTL cache with single-flight and stale-while-revalidate. ' +
             'The `cache.status` is `miss` on the first load, `hit` within the TTL, and `stale` while ' +
-            'a background refresh is in flight. Use `?fresh=1` to bypass the cache (still single-flighted).',
+            'a background refresh is in flight. Use `?fresh=1` to bypass the cache (still single-flighted). ' +
+            'Returns the same typed EscrowState from both paths: the live Soroban RPC read and the deploy ' +
+            'snapshot fallback. Set `strict=true` to fail instead of falling back to the snapshot.',
           parameters: [
             {
               name: 'fresh',
@@ -330,6 +434,13 @@ function buildSpec(baseUrl) {
               schema: { type: 'string', enum: ['1', 'true'] },
               description: 'Bypass the cache and force a reload (still single-flighted).',
             },
+            {
+              name: 'strict',
+              in: 'query',
+              required: false,
+              description: 'When true, respond 503 instead of falling back to the deploy snapshot',
+              schema: { type: 'boolean', default: false },
+            },
           ],
           responses: {
             200: {
@@ -337,6 +448,14 @@ function buildSpec(baseUrl) {
               ...json({ type: 'object', oneOf: [EscrowLiveResponse, EscrowSnapshotResponse] }),
             },
             304: { description: 'Not Modified (ETag match)' },
+            503: {
+              description: 'Live read failed and strict mode was requested',
+              ...json({
+                type: 'object',
+                required: ['error', 'code'],
+                properties: { error: { type: 'string' }, code: { type: 'string', enum: ['ESCROW_LIVE_UNAVAILABLE'] } },
+              }),
+            },
           },
         },
       },
