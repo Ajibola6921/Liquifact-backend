@@ -350,6 +350,30 @@ function buildSpec(baseUrl) {
           },
         },
       },
+      '/api/invoices/{id}/settle': {
+        post: {
+          tags: ['Invoices'],
+          summary: 'Mark a fully funded invoice as settled',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            200: { description: 'Invoice settled', ...json({ type: 'object', properties: { data: Invoice } }) },
+            404: { description: 'Not found', ...json(ErrorBody) },
+            409: { description: 'Invoice not funded', ...json(ErrorBody) },
+          },
+        },
+      },
+      '/api/invoices/{id}/cancel': {
+        post: {
+          tags: ['Invoices'],
+          summary: 'Cancel an open or funded invoice',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            200: { description: 'Invoice cancelled', ...json({ type: 'object', properties: { data: Invoice } }) },
+            404: { description: 'Not found', ...json(ErrorBody) },
+            409: { description: 'Invoice not cancellable', ...json(ErrorBody) },
+          },
+        },
+      },
       '/api/invoices/{id}/contributions': {
         get: {
           tags: ['Invoices'],
