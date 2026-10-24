@@ -66,6 +66,10 @@ const ENDPOINTS = [
   { method: 'POST', path: '/api/internal/indexer/run', description: 'Manually trigger escrow event indexer (internal, Bearer CRON_SECRET)' },
   { method: 'GET', path: '/api/reconciliation', description: 'Reconcile all on-chain invoices against escrow state' },
   { method: 'GET', path: '/api/reconciliation/:id', description: 'Reconcile one invoice against escrow state' },
+  { method: 'POST', path: '/api/webhooks', description: 'Register a webhook subscription (admin)' },
+  { method: 'GET', path: '/api/webhooks', description: 'List webhook subscriptions (admin)' },
+  { method: 'DELETE', path: '/api/webhooks/:id', description: 'Remove a webhook subscription (admin)' },
+  { method: 'GET', path: '/api/webhooks/:id/deliveries', description: 'Last 50 delivery records for a webhook (admin)' },
 ];
 
 app.get('/', (req, res) => {
@@ -121,6 +125,10 @@ app.use('/api/investors', require('./routes/investors'));
 app.use('/api/invoices/:id/document', require('./routes/invoiceDocument'));
 app.use('/api/escrow', require('./routes/escrow'));
 app.use('/api/reconciliation', require('./routes/reconciliation'));
+app.use('/api/webhooks', require('./routes/webhooks'));
+
+// Start webhook delivery listener (idempotent — safe to call multiple times)
+require('./webhooks/deliver').startListening();
 
 // Escrow event indexer routes (feat/escrow-event-indexer)
 app.use('/api/escrow/events', require('./routes/escrowEvents'));

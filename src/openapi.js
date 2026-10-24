@@ -284,6 +284,58 @@ const adminErrors = {
   503: { description: 'ADMIN_API_TOKEN is not configured on the server', ...json(ErrorBody) },
 };
 
+const WebhookSubscription = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', example: 'wh_a1b2c3d4e5f6a7b8' },
+    url: { type: 'string', format: 'uri', example: 'https://example.com/hooks' },
+    events: {
+      type: 'array',
+      items: { type: 'string', enum: ['invoice.created', 'invoice.funding_received', 'invoice.funded'] },
+    },
+    createdAt: { type: 'string', format: 'date-time' },
+  },
+};
+
+const WebhookCreatedResponse = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', example: 'wh_a1b2c3d4e5f6a7b8' },
+    secret: {
+      type: 'string',
+      description: 'base64url-encoded 32-byte signing secret. Shown once — store it securely.',
+      example: 'abc123...',
+    },
+    url: { type: 'string', format: 'uri' },
+    events: { type: 'array', items: { type: 'string' } },
+    createdAt: { type: 'string', format: 'date-time' },
+  },
+};
+
+const DeliveryAttempt = {
+  type: 'object',
+  properties: {
+    attempt: { type: 'integer', example: 1 },
+    status: { type: 'integer', nullable: true, example: 200 },
+    durationMs: { type: 'integer', example: 142 },
+    error: { type: 'string', nullable: true },
+  },
+};
+
+const DeliveryRecord = {
+  type: 'object',
+  properties: {
+    deliveryId: { type: 'string', example: 'dlv_a1b2c3d4e5f6' },
+    eventId: { type: 'string', example: 'evt_a1b2c3d4e5f6a7b8' },
+    eventType: { type: 'string', example: 'invoice.created' },
+    webhookId: { type: 'string' },
+    url: { type: 'string', format: 'uri' },
+    status: { type: 'string', enum: ['pending', 'delivered', 'failed'] },
+    attempts: { type: 'array', items: DeliveryAttempt },
+    createdAt: { type: 'string', format: 'date-time' },
+  },
+};
+
 // Built documents are memoised per base URL (bounded, since the base URL can come from the Host header).
 const SPEC_CACHE_LIMIT = 16;
 const specCache = new Map();
@@ -330,6 +382,7 @@ function createSpec(baseUrl) {
       { name: 'Escrow' },
       { name: 'Reconciliation' },
       { name: 'Audit' },
+      { name: 'Webhooks' },
     ],
     components: {
       securitySchemes: {
@@ -1053,6 +1106,85 @@ function createSpec(baseUrl) {
                 properties: { error: { type: 'string', example: 'NOT_ON_CHAIN' }, detail: { type: 'string' } },
               }),
             },
+          },
+        },
+      },
+      '/api/webhooks': {
+        post: {
+          tags: ['Webhooks'],
+          summary: 'Register a webhook subscription',
+          description:
+            'Requires `Authorization: Bearer <ADMIN_API_TOKEN>`. Returns 503 if ADMIN_API_TOKEN is not configured. ' +
+            'Deliveries are signed with the returned secret (`LiquiFact-Signature` header).',
+          security: adminSecurity,
+          requestBody: {
+            required: true,
+            ...json({
+              type: 'object',
+              required: ['url', 'events'],
+              properties: {
+                url: {
+                  type: 'string',
+                  format: 'uri',
+                  description: 'HTTPS endpoint to receive events. HTTP allowed only for localhost in non-production.',
+                  example: 'https://example.com/hooks',
+                },
+                events: {
+                  type: 'array',
+                  items: { type: 'string', enum: ['invoice.created', 'invoice.funding_received', 'invoice.funded'] },
+                  example: ['invoice.created', 'invoice.funded'],
+                },
+              },
+            }),
+          },
+          responses: {
+            201: {
+              description: 'Subscription created. The `secret` field is shown exactly once — store it securely.',
+              ...json({ type: 'object', properties: { data: WebhookCreatedResponse } }),
+            },
+            400: { description: 'Validation failed (bad URL, invalid events, SSRF)', ...json(ErrorBody) },
+            ...adminErrors,
+          },
+        },
+        get: {
+          tags: ['Webhooks'],
+          summary: 'List webhook subscriptions',
+          security: adminSecurity,
+          responses: {
+            200: {
+              description: 'List of subscriptions (secrets not included)',
+              ...json({ type: 'object', properties: { data: { type: 'array', items: WebhookSubscription } } }),
+            },
+            ...adminErrors,
+          },
+        },
+      },
+      '/api/webhooks/{id}': {
+        delete: {
+          tags: ['Webhooks'],
+          summary: 'Delete a webhook subscription',
+          security: adminSecurity,
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            204: { description: 'Deleted' },
+            404: { description: 'Webhook not found', ...json(ErrorBody) },
+            ...adminErrors,
+          },
+        },
+      },
+      '/api/webhooks/{id}/deliveries': {
+        get: {
+          tags: ['Webhooks'],
+          summary: 'Last 50 delivery records for a webhook',
+          security: adminSecurity,
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            200: {
+              description: 'Delivery log (most recent first)',
+              ...json({ type: 'object', properties: { data: { type: 'array', items: DeliveryRecord } } }),
+            },
+            404: { description: 'Webhook not found', ...json(ErrorBody) },
+            ...adminErrors,
           },
         },
       },

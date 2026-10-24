@@ -12,6 +12,7 @@ const { requireAdminToken } = require('../middleware/require-admin-token');
 const escrowReader = require('./escrow');
 const { CreateInvoiceBody, FundInvoiceBodyShape, InvoiceIdParam } = require('../schemas');
 const { validate } = require('../middleware/validate');
+const emitter = require('../webhooks/emitter');
 
 const router = express.Router();
 router.use(auditContext());
@@ -170,6 +171,7 @@ router.post('/', validate({ body: CreateInvoiceBody, audit: 'invoice.create' }),
     statusCode: 201,
     after: invoice,
   });
+  emitter.emit('invoice.created', present(invoice));
   return res.status(201).json({ data: present(invoice) });
 });
 
@@ -228,7 +230,13 @@ router.post('/:id/fund', validate({ params: InvoiceIdParam, body: FundInvoiceBod
     }
     accepted = remainingCapacity;
   }
+  const wasFunded = invoice.status === 'funded';
   const updated = store.fund(invoice, accepted, investor);
+  // Emit funding_received for every contribution; emit funded when status flips to funded
+  emitter.emit('invoice.funding_received', present(updated));
+  if (!wasFunded && updated.status === 'funded') {
+    emitter.emit('invoice.funded', present(updated));
+  }
   record({
     outcome: 'success',
     statusCode: 200,
