@@ -48,6 +48,8 @@ const ENDPOINTS = [
   { method: 'GET', path: '/api/invoices/:id/quote', description: 'Quote an investment contribution and annualised returns' },
   { method: 'POST', path: '/api/invoices', description: 'Submit an invoice for financing' },
   { method: 'POST', path: '/api/invoices/:id/fund', description: 'Record an investor contribution' },
+  { method: 'GET', path: '/api/audit', description: 'Audit log entries (admin; ?resourceId=&action=&limit=&after=)' },
+  { method: 'GET', path: '/api/audit/verify', description: 'Verify the audit hash chain (admin)' },
   { method: 'GET', path: '/api/invoices/:id/contributions', description: 'List contributions for an invoice' },
   { method: 'GET', path: '/api/investors/:address/portfolio', description: 'Investor portfolio summary and expected returns' },
   { method: 'POST', path: '/api/invoices/:id/document', description: 'Upload invoice PDF document' },
@@ -109,6 +111,7 @@ app.get('/api/stats', (req, res) => {
 });
 
 app.use('/api/invoices', require('./routes/invoices'));
+app.use('/api/audit', require('./routes/audit'));
 app.use('/api/investors', require('./routes/investors'));
 app.use('/api/invoices/:id/document', require('./routes/invoiceDocument'));
 app.use('/api/escrow', require('./routes/escrow'));

@@ -150,6 +150,57 @@ const ReconciliationReport = {
   required: ['checkedAt', 'summary', 'results'],
 };
 
+const AuditEntry = {
+  type: 'object',
+  description:
+    'One append-only audit record. `hash` = sha256(prevHash + canonicalJSON(entry without hash)); the first entry ' +
+    'links to a prevHash of 64 zeros.',
+  required: ['seq', 'at', 'action', 'resourceType', 'outcome', 'statusCode', 'prevHash', 'hash'],
+  properties: {
+    seq: { type: 'integer', example: 3 },
+    at: { type: 'string', format: 'date-time' },
+    action: { type: 'string', example: 'invoice.fund' },
+    resourceType: { type: 'string', example: 'invoice' },
+    resourceId: { type: 'string', nullable: true, example: 'INV_0002' },
+    actor: { type: 'string', example: 'anonymous' },
+    ip: { type: 'string', nullable: true, description: 'Client IP truncated to /24 (IPv4) or /48 (IPv6)', example: '203.0.113.0/24' },
+    requestId: { type: 'string', nullable: true },
+    outcome: { type: 'string', enum: ['success', 'rejected'] },
+    statusCode: { type: 'integer', example: 200 },
+    before: { type: 'object', nullable: true, additionalProperties: true },
+    after: { type: 'object', nullable: true, additionalProperties: true },
+    metadata: { type: 'object', nullable: true, additionalProperties: true },
+    prevHash: { type: 'string', example: '0000000000000000000000000000000000000000000000000000000000000000' },
+    hash: { type: 'string' },
+  },
+};
+
+const AuditList = {
+  type: 'object',
+  required: ['data', 'count', 'nextAfter'],
+  properties: {
+    data: { type: 'array', items: { $ref: '#/components/schemas/AuditEntry' } },
+    count: { type: 'integer' },
+    nextAfter: { type: 'integer', nullable: true, description: 'Pass as `after` to get the next page; null on the last page' },
+  },
+};
+
+const AuditVerification = {
+  type: 'object',
+  required: ['valid'],
+  properties: {
+    valid: { type: 'boolean' },
+    entries: { type: 'integer', description: 'Number of entries checked (when valid)' },
+    brokenAt: { type: 'integer', description: 'seq of the first entry that fails verification (when not valid)' },
+  },
+};
+
+const adminSecurity = [{ adminBearer: [] }];
+const adminErrors = {
+  401: { description: 'Missing or invalid admin token', ...json(ErrorBody) },
+  503: { description: 'ADMIN_API_TOKEN is not configured on the server', ...json(ErrorBody) },
+};
+
 /**
  * Builds the OpenAPI document for the given public base URL.
  *
@@ -167,11 +218,28 @@ function buildSpec(baseUrl) {
         `contract holds funds until settlement. Escrow contract (${config.network}): ${config.contractId}`,
     },
     servers: [{ url: baseUrl }],
-    tags: [{ name: 'System' }, { name: 'Invoices' }, { name: 'Investors' }, { name: 'Escrow' }, { name: 'Reconciliation' }],
+    tags: [
+      { name: 'System' },
+      { name: 'Invoices' },
+      { name: 'Investors' },
+      { name: 'Escrow' },
+      { name: 'Reconciliation' },
+      { name: 'Audit' },
+    ],
     components: {
+      securitySchemes: {
+        adminBearer: {
+          type: 'http',
+          scheme: 'bearer',
+          description: 'Shared admin secret: `Authorization: Bearer <ADMIN_API_TOKEN>`',
+        },
+      },
       schemas: {
         EscrowState,
         EscrowLiveResponse,
+        AuditEntry,
+        AuditList,
+        AuditVerification,
       },
     },
     paths: {
@@ -260,6 +328,7 @@ function buildSpec(baseUrl) {
         post: {
           tags: ['Invoices'],
           summary: 'Submit an invoice for financing',
+          description: 'Every attempt, accepted or rejected, is recorded in the audit log as `invoice.create`.',
           requestBody: {
             required: true,
             ...json({
@@ -329,6 +398,9 @@ function buildSpec(baseUrl) {
         post: {
           tags: ['Invoices'],
           summary: 'Record an investor contribution (demo, off-chain)',
+          description:
+            'Every attempt, accepted or rejected (400, 404, 409, 422), is recorded in the audit log as `invoice.fund`, ' +
+            'with the invoice `fundedAmount` and `status` before and after.',
           parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
           requestBody: {
             required: true,
@@ -354,6 +426,7 @@ function buildSpec(baseUrl) {
         post: {
           tags: ['Invoices'],
           summary: 'Mark a fully funded invoice as settled',
+          description: 'Every attempt, accepted or rejected, is recorded in the audit log as `invoice.settle`.',
           parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
           responses: {
             200: { description: 'Invoice settled', ...json({ type: 'object', properties: { data: Invoice } }) },
@@ -366,6 +439,7 @@ function buildSpec(baseUrl) {
         post: {
           tags: ['Invoices'],
           summary: 'Cancel an open or funded invoice',
+          description: 'Every attempt, accepted or rejected, is recorded in the audit log as `invoice.cancel`.',
           parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
           responses: {
             200: { description: 'Invoice cancelled', ...json({ type: 'object', properties: { data: Invoice } }) },
@@ -556,6 +630,39 @@ function buildSpec(baseUrl) {
               }),
             },
             404: { description: 'Invoice or document not found', ...json(ErrorBody) },
+          },
+        },
+      },
+      '/api/audit': {
+        get: {
+          tags: ['Audit'],
+          summary: 'List audit log entries (admin)',
+          description: 'Oldest first. Page with `after` set to the previous response\'s `nextAfter`.',
+          security: adminSecurity,
+          parameters: [
+            { name: 'resourceId', in: 'query', schema: { type: 'string' }, description: 'Only entries for this resource' },
+            { name: 'action', in: 'query', schema: { type: 'string' }, description: 'Only this action, e.g. invoice.fund' },
+            { name: 'limit', in: 'query', schema: { type: 'integer', minimum: 1, maximum: 200, default: 50 } },
+            { name: 'after', in: 'query', schema: { type: 'integer', minimum: 0 }, description: 'Only entries with seq greater than this' },
+          ],
+          responses: {
+            200: { description: 'A page of entries', ...json({ $ref: '#/components/schemas/AuditList' }) },
+            400: { description: 'Invalid query parameter', ...json(ErrorBody) },
+            ...adminErrors,
+          },
+        },
+      },
+      '/api/audit/verify': {
+        get: {
+          tags: ['Audit'],
+          summary: 'Verify the audit hash chain (admin)',
+          description:
+            'Recomputes every retained entry\'s hash and checks the links between them, starting from the oldest ' +
+            'retained entry\'s prevHash.',
+          security: adminSecurity,
+          responses: {
+            200: { description: 'Chain verification result', ...json({ $ref: '#/components/schemas/AuditVerification' }) },
+            ...adminErrors,
           },
         },
       },
