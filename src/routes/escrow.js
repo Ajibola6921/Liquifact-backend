@@ -29,18 +29,19 @@ const DEPLOY_SNAPSHOT = {
  * Reads `get_escrow` from the deployed contract via a Soroban RPC simulation.
  * Returns the raw `ScVal` so callers decode it with `decodeEscrow`.
  *
- * @param {number} timeoutMs abort after this many milliseconds
+ * @param {string} [contractId] escrow contract to read (defaults to the configured contract)
+ * @param {number} [timeoutMs] abort after this many milliseconds
  * @returns {Promise<{ native: import('@stellar/stellar-sdk').xdr.ScVal, latestLedger?: number }>}
  *   the raw simulation result and the ledger it was read from
  */
-async function readEscrowOnChain(timeoutMs = 6000) {
+async function readEscrowOnChain(contractId = config.contractId, timeoutMs = 6000) {
   const sdk = require('@stellar/stellar-sdk');
   const { rpc, Contract, TransactionBuilder, Account, BASE_FEE, scValToNative } = sdk;
   const server = new rpc.Server(config.rpcUrl);
   // Simulation does not need a real or funded source account.
   const source = new Account('GA7TXEBMEPQCLHIYCWDN7RKAO5IMRD2UV7O7TZXMEW6VZUMEXNR4XBB5', '0');
   const tx = new TransactionBuilder(source, { fee: BASE_FEE, networkPassphrase: config.networkPassphrase })
-    .addOperation(new Contract(config.contractId).call('get_escrow'))
+    .addOperation(new Contract(contractId).call('get_escrow'))
     .setTimeout(30)
     .build();
   const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('RPC timeout')), timeoutMs));

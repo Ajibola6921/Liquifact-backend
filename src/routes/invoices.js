@@ -8,6 +8,8 @@ const contributions = require('../data/contributions');
 const config = require('../config');
 const { toMinor, fromMinor, couponMinor, daysBetween, annualisedBps } = require('../domain/returns');
 const { parseInvoiceQuery, queryInvoices, InvoiceQueryError } = require('../services/invoice-query');
+const { requireAdminToken } = require('../middleware/require-admin-token');
+const escrowReader = require('./escrow');
 
 const router = express.Router();
 router.use(auditContext());
@@ -363,5 +365,163 @@ router.post('/:id/cancel', (req, res) => {
   return audit.success(before, store.cancel(invoice));
 });
 
+/**
+ * Converts an exact decimal amount to 7-decimal stroops without rounding away
+ * excess precision.
+ *
+ * @param {number} amount decimal amount
+ * @returns {string|null} stroops as a decimal integer string, or null if not exactly representable
+ */
+function exactStroops(amount) {
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount < 0) {
+    return null;
+  }
+  const match = /^(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/i.exec(String(amount));
+  if (!match) {
+    return null;
+  }
+  const digits = match[1] + (match[2] || '');
+  const shift = Number(match[3] || 0) - (match[2] || '').length + 7;
+  if (shift < 0) {
+    const excess = -shift;
+    if (excess > digits.length) {
+      return /^0+$/.test(digits) ? '0' : null;
+    }
+    if (!/^0*$/.test(digits.slice(-excess))) {
+      return null;
+    }
+    return BigInt(digits.slice(0, -excess) || '0').toString();
+  }
+  return (BigInt(digits) * 10n ** BigInt(shift)).toString();
+}
+
+/**
+ * Compares an invoice's terms against a decoded `get_escrow` struct.
+ *
+ * @param {object} invoice off-chain invoice
+ * @param {object} escrow on-chain escrow struct
+ * @returns {Array<{ field: string, expected: string|null, actual: string|null }>} mismatches
+ */
+function validateEscrowTerms(invoice, escrow) {
+  const mismatches = [];
+  const check = (field, expected, actual) => {
+    if (expected === null || String(expected) !== String(actual)) {
+      mismatches.push({ field, expected: expected === null ? null : String(expected), actual: actual == null ? null : String(actual) });
+    }
+  };
+  check('invoice_id', invoice.id, escrow.invoice_id);
+  check('amount', exactStroops(invoice.amount), escrow.amount);
+  if (invoice.smeAddress) {
+    check('sme_address', invoice.smeAddress, escrow.sme_address);
+  }
+  check('yield_bps', invoice.yieldBps, escrow.yield_bps);
+  if (String(escrow.status) === '4') {
+    mismatches.push({ field: 'status', expected: 'not cancelled (4)', actual: '4' });
+  }
+  return mismatches;
+}
+
+/**
+ * Makes a decoded contract value JSON-serialisable (BigInt -> decimal string).
+ *
+ * @param {unknown} value decoded value
+ * @returns {unknown} JSON-safe copy
+ */
+function jsonSafe(value) {
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+  if (Buffer.isBuffer(value)) {
+    return value.toString('hex');
+  }
+  if (Array.isArray(value)) {
+    return value.map(jsonSafe);
+  }
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, jsonSafe(v)]));
+  }
+  return value;
+}
+
+/**
+ * Reads the raw `get_escrow` struct of a contract.
+ *
+ * @param {string} contractId escrow contract id
+ * @returns {Promise<object>} decoded native escrow struct
+ */
+async function readEscrow(contractId) {
+  const result = await escrowReader.readEscrowOnChain(contractId);
+  return result ? result.native : result;
+}
+
+router.post('/:id/escrow', requireAdminToken, async (req, res) => {
+  const { contractId } = req.body || {};
+  if (typeof contractId !== 'string' || !StrKey.isValidContract(contractId)) {
+    return res.status(400).json({ code: 'INVALID_CONTRACT_ID', error: 'Invalid Stellar contract ID' });
+  }
+  const invoice = store.get(req.params.id);
+  if (!invoice) {
+    return res.status(404).json({ code: 'INVOICE_NOT_FOUND', error: 'Invoice not found' });
+  }
+  if (invoice.escrowContractId === contractId) {
+    return res.json({ data: present(invoice) });
+  }
+  if (invoice.escrowContractId) {
+    return res.status(409).json({ code: 'ALREADY_LINKED', error: 'Invoice already linked to another escrow' });
+  }
+  if (store.list().some((i) => i.id !== invoice.id && i.escrowContractId === contractId)) {
+    return res.status(409).json({ code: 'CONTRACT_IN_USE', error: 'Contract already linked to another invoice' });
+  }
+  let escrow;
+  try {
+    escrow = await readEscrow(contractId);
+  } catch {
+    return res.status(422).json({ code: 'ESCROW_NOT_FOUND', error: 'Contract escrow could not be read' });
+  }
+  if (!escrow || typeof escrow !== 'object' || Array.isArray(escrow)) {
+    return res.status(422).json({ code: 'ESCROW_NOT_FOUND', error: 'Contract is not an escrow' });
+  }
+  // Reject arbitrary contract return values masquerading as escrow structs.
+  if (['invoice_id', 'amount', 'yield_bps', 'status'].some((key) => escrow[key] === undefined || escrow[key] === null)
+    || (invoice.smeAddress && (escrow.sme_address === undefined || escrow.sme_address === null))) {
+    return res.status(422).json({ code: 'ESCROW_NOT_FOUND', error: 'Contract returned an invalid escrow' });
+  }
+  const mismatches = validateEscrowTerms(invoice, escrow);
+  if (mismatches.length) {
+    return res.status(422).json({ code: 'ESCROW_TERMS_MISMATCH', mismatches });
+  }
+  const conflict = store.linkEscrow(invoice, contractId);
+  if (conflict) {
+    return res.status(409).json({ code: conflict, error: 'Escrow link conflict' });
+  }
+  req.audit({
+    action: 'invoice.escrow.link',
+    resourceType: 'invoice',
+    resourceId: invoice.id,
+    outcome: 'success',
+    statusCode: 200,
+    before: { escrowContractId: null },
+    after: { escrowContractId: contractId },
+  });
+  return res.json({ data: present(invoice) });
+});
+
+router.get('/:id/escrow', async (req, res) => {
+  const invoice = store.get(req.params.id);
+  if (!invoice) {
+    return res.status(404).json({ code: 'INVOICE_NOT_FOUND', error: 'Invoice not found' });
+  }
+  if (!invoice.escrowContractId) {
+    return res.status(404).json({ code: 'NOT_LINKED', error: 'Invoice has no linked escrow' });
+  }
+  try {
+    const escrow = await readEscrow(invoice.escrowContractId);
+    return res.json({ contractId: invoice.escrowContractId, escrow: jsonSafe(escrow) });
+  } catch {
+    return res.status(422).json({ code: 'ESCROW_NOT_FOUND', error: 'Linked escrow could not be read' });
+  }
+});
+
 module.exports = router;
+module.exports.exactStroops = exactStroops;
 module.exports.validateInvoice = validateInvoice;

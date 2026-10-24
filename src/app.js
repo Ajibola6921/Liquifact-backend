@@ -48,6 +48,8 @@ const ENDPOINTS = [
   { method: 'GET', path: '/api/invoices/:id/quote', description: 'Quote an investment contribution and annualised returns' },
   { method: 'POST', path: '/api/invoices', description: 'Submit an invoice for financing' },
   { method: 'POST', path: '/api/invoices/:id/fund', description: 'Record an investor contribution' },
+  { method: 'POST', path: '/api/invoices/:id/escrow', description: 'Admin: link a verified escrow contract' },
+  { method: 'GET', path: '/api/invoices/:id/escrow', description: 'Read the invoice\'s linked on-chain escrow' },
   { method: 'GET', path: '/api/audit', description: 'Audit log entries (admin; ?resourceId=&action=&limit=&after=)' },
   { method: 'GET', path: '/api/audit/verify', description: 'Verify the audit hash chain (admin)' },
   { method: 'GET', path: '/api/invoices/:id/contributions', description: 'List contributions for an invoice' },

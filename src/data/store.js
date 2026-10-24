@@ -9,6 +9,7 @@
 
 const assert = require('node:assert');
 const contributions = require('./contributions');
+const config = require('../config');
 
 const STATUSES = ['open', 'funded', 'settled', 'cancelled'];
 const INVOICE_ID_PATTERN = /^[A-Za-z0-9_]{1,32}$/;
@@ -26,7 +27,7 @@ const seed = () => {
     yieldBps: 800,
     dueDate: '2027-01-17',
     status: 'open',
-    onChain: true,
+    escrowContractId: config.contractId,
     createdAt: '2026-10-19T00:00:00.000Z',
   },
   {
@@ -40,7 +41,7 @@ const seed = () => {
     yieldBps: 650,
     dueDate: '2026-12-30',
     status: 'open',
-    onChain: false,
+    escrowContractId: null,
     createdAt: '2026-10-02T09:30:00.000Z',
   },
   {
@@ -54,7 +55,7 @@ const seed = () => {
     yieldBps: 720,
     dueDate: '2026-11-28',
     status: 'funded',
-    onChain: false,
+    escrowContractId: null,
     createdAt: '2026-09-15T14:00:00.000Z',
   },
   {
@@ -68,7 +69,7 @@ const seed = () => {
     yieldBps: 900,
     dueDate: '2026-09-30',
     status: 'settled',
-    onChain: false,
+    escrowContractId: null,
     createdAt: '2026-07-01T08:00:00.000Z',
   },
   ];
@@ -162,6 +163,24 @@ class DuplicateInvoiceError extends Error {
     this.code = code;
     this.existingId = existingId;
   }
+}
+
+/**
+ * Defines `onChain` as a derived, enumerable property: an invoice is on-chain
+ * exactly when it has a verified linked escrow contract.
+ *
+ * @param {object} invoice invoice record
+ * @returns {object} the same record
+ */
+function withDerivedOnChain(invoice) {
+  Object.defineProperty(invoice, 'onChain', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      return this.escrowContractId !== null && this.escrowContractId !== undefined;
+    },
+  });
+  return invoice;
 }
 
 let invoices = [];
@@ -279,12 +298,13 @@ function create(invoice) {
     id,
     fundedAmount: 0,
     status: 'open',
-    onChain: false,
+    escrowContractId: null,
     createdAt: new Date().toISOString(),
     duplicateOverride: invoice.confirmNotDuplicate === true,
     ...invoice,
   };
   delete record.confirmNotDuplicate;
+  withDerivedOnChain(record);
   invoices.push(record);
   indexInvoice(record);
   return record;
@@ -351,8 +371,26 @@ function cancel(invoice) {
 /** Restores the seed data (used by tests). */
 function reset() {
   contributions.reset();
-  invoices = seed();
+  invoices = seed().map(withDerivedOnChain);
   rebuildIndexes();
+}
+
+/**
+ * Links a verified escrow contract to an invoice.
+ *
+ * @param {object} invoice target invoice
+ * @param {string} contractId verified escrow contract id
+ * @returns {null|'ALREADY_LINKED'|'CONTRACT_IN_USE'} null on success, otherwise the conflict code
+ */
+function linkEscrow(invoice, contractId) {
+  if (invoice.escrowContractId && invoice.escrowContractId !== contractId) {
+    return 'ALREADY_LINKED';
+  }
+  if (invoices.some((other) => other !== invoice && other.escrowContractId === contractId)) {
+    return 'CONTRACT_IN_USE';
+  }
+  invoice.escrowContractId = contractId;
+  return null;
 }
 
 reset();
@@ -375,5 +413,6 @@ module.exports = {
   remaining,
   settle,
   cancel,
+  linkEscrow,
   reset,
 };

@@ -22,14 +22,14 @@ const digest = (text) => crypto.createHash('sha256').update(text).digest();
 function requireAdminToken(req, res, next) {
   const expected = process.env.ADMIN_API_TOKEN;
   if (!expected) {
-    res.status(503).json({ error: 'Admin API is not configured' });
+    res.status(503).json({ error: 'Admin API is not configured', code: 'ADMIN_TOKEN_NOT_CONFIGURED' });
     return;
   }
   const match = /^Bearer\s+(\S+)\s*$/i.exec(req.get('authorization') || '');
   const matches = crypto.timingSafeEqual(digest(match ? match[1] : ''), digest(expected));
   if (!match || !matches) {
     res.set('WWW-Authenticate', 'Bearer');
-    res.status(401).json({ error: 'Admin token required' });
+    res.status(401).json({ error: 'Admin token required', code: 'UNAUTHORIZED' });
     return;
   }
   next();
