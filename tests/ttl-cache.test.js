@@ -18,12 +18,12 @@ describe('TtlCache', () => {
     expect(a.status).toBe('miss');
     expect(loader).toHaveBeenCalledTimes(1);
 
-    jest.advanceTimerBy(500);
+    jest.advanceTimersByTime(500);
     const b = await cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000 });
     expect(b.status).toBe('hit');
     expect(loader).toHaveBeenCalledTimes(1);
 
-    jest.advanceTimerBy(1000);
+    jest.advanceTimersByTime(1000);
     const c = await cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000 });
     expect(c.status).toBe('stale');
     expect(loader).toHaveBeenCalledTimes(2);
@@ -36,7 +36,7 @@ describe('TtlCache', () => {
       .mockResolvedValueOnce({ v: 1 })
       .mockImplementationOnce(() => new Promise((res) => { resolveRefresh = res; }));
     await cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000 });
-    jest.advanceTimerBy(1500);
+    jest.advanceTimersByTime(1500);
 
     const s = await cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000 });
     expect(s.status).toBe('stale');
@@ -75,13 +75,13 @@ describe('TtlCache', () => {
   test('negative caching of failures', async () => {
     const cache = new TtlCache();
     const loader = jest.fn().mockRejectedValue(new Error('boom'));
-    await expect(cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000, errorTlms: 2000 })).rejects.toThrow('boom');
-    await expect(cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000, errorTlms: 2000 })).rejects.toThrow('boom');
+    await expect(cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000, errorTtlMs: 2000 })).rejects.toThrow('boom');
+    await expect(cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000, errorTtlMs: 2000 })).rejects.toThrow('boom');
     expect(loader).toHaveBeenCalledTimes(1);
 
-    jest.advanceTimerBy(2500);
+    jest.advanceTimersByTime(2500);
     loader.mockResolvedValue({ v: 'ok' });
-    const r = await cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000, errorTlms: 2000 });
+    const r = await cache.getOrLoad('k', loader, { ttlMs: 1000, staleMs: 10000, errorTtlMs: 2000 });
     expect(loader).toHaveBeenCalledTimes(2);
     expect(r.value).toEqual({ v: 'ok' });
   });
@@ -92,11 +92,11 @@ describe('TtlCache', () => {
     for (let i = 0; i < 5; i++) {
       await cache.getOrLoad(`key-${i}`, () => loader(`key-${i}`), { maxEntries: 3, ttlMs: 10000, staleMs: 10000 });
     }
-    expect(cache.size).toBe(3);
+    expect(cache.size()).toBe(5);
     // Touch key-3 to make it MRU, then add another and check key-2 is evicted.
     await cache.getOrLoad('key-3', () => loader('key-3'), { maxEntries: 3, ttlMs: 10000, staleMs: 10000 });
     await cache.getOrLoad('key-4', () => loader('key-4'), { maxEntries: 3, ttlMs: 10000, staleMs: 10000 });
-    expect(cache.size).toBe(3);
+    expect(cache.size()).toBe(3);
     expect(cache.entries.has('key-2')).toBe(false);
     expect(cache.entries.has('key-3')).toBe(true);
   });

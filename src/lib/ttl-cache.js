@@ -135,7 +135,9 @@ class TtlCache {
    */
   peek(key) {
     const entry = this.entries.get(key);
-    if (!entry || entry.isError) return null;
+    if (!entry || entry.isError) {
+      return null;
+    }
     return {
       value: entry.value,
       ageMs: Date.now() - entry.fetchedAt,
@@ -152,7 +154,9 @@ class TtlCache {
   }
 
   setEntry(key, entry) {
-    if (this.entries.has(key)) this.entries.delete(key);
+    if (this.entries.has(key)) {
+      this.entries.delete(key);
+    }
     this.entries.set(key, entry);
     this.evictIfOver();
   }
@@ -160,14 +164,18 @@ class TtlCache {
   evictIfOver() {
     while (this.entries.size > this.maxEntries) {
       const oldestKey = this.entries.keys().next().value;
-      if (oldestKey === undefined) break;
+      if (oldestKey === undefined) {
+        break;
+      }
       this.entries.delete(oldestKey);
     }
   }
 
   loadSingleFlight(key, loader, errorTtlMs) {
     const existing = this.inflight.get(key);
-    if (existing) return existing;
+    if (existing) {
+      return existing;
+    }
 
     const promise = (async () => {
       try {
@@ -206,7 +214,9 @@ class TtlCache {
   }
 
   startBackgroundRefresh(key, loader, errorTtlMs) {
-    if (this.inflight.has(key)) return;
+    if (this.inflight.has(key)) {
+      return;
+    }
     // Fire-and-forget; errors are negative-cached by loadSingleFlight.
     this.loadSingleFlight(key, loader, errorTtlMs).catch(() => {});
   }
