@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const request = require('supertest');
+const SwaggerParser = require('@apidevtools/swagger-parser');
 const app = require('../src/app');
 const store = require('../src/data/store');
 const { defaultDocumentStore } = require('../src/data/documentStore');
@@ -547,5 +548,112 @@ describe('openapi.json — document routes are present', () => {
     expect(responses['413']).toBeDefined();
     expect(responses['415']).toBeDefined();
     expect(responses['422']).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// zod validation and generated OpenAPI schemas (#1562)
+// ---------------------------------------------------------------------------
+describe('zod validation (#1562)', () => {
+  const INVESTOR = 'GBTUJNOF2WAAUPKCJHBB76ID5HGN6KMTUG43F3Z344T7QRTP7B7TVPVC';
+
+  test('CreateInvoiceBody.properties.amount has exclusiveMinimum/maximum and names have maxLength 120', async () => {
+    const res = await request(app).get('/openapi.json');
+    expect(res.status).toBe(200);
+    const props = res.body.components.schemas.CreateInvoiceBody.properties;
+    expect(props.amount.maximum).toBe(1e12);
+    // OAS 3.0: exclusiveMinimum is a boolean paired with minimum
+    expect(props.amount.exclusiveMinimum).toBe(true);
+    expect(props.amount.minimum).toBe(0);
+    expect(props.sme.maxLength).toBe(120);
+    expect(props.debtor.maxLength).toBe(120);
+  });
+
+  test('FundInvoiceBody marks amount and investor as required', async () => {
+    const res = await request(app).get('/openapi.json');
+    const fundSchema = res.body.components.schemas.FundInvoiceBody;
+    expect(fundSchema.required).toEqual(expect.arrayContaining(['amount', 'investor']));
+  });
+
+  test('request bodies in paths are the generated component schemas', async () => {
+    const { body: spec } = await request(app).get('/openapi.json');
+    const create = spec.paths['/api/invoices'].post.requestBody.content['application/json'].schema;
+    const fund = spec.paths['/api/invoices/{id}/fund'].post.requestBody.content['application/json'].schema;
+    expect(create).toEqual(spec.components.schemas.CreateInvoiceBody);
+    expect(fund).toEqual(spec.components.schemas.FundInvoiceBody);
+    expect(spec.paths['/api/invoices'].post.responses['415']).toBeDefined();
+    expect(spec.paths['/api/invoices/{id}/fund'].post.responses['415']).toBeDefined();
+    expect(Object.keys(spec.components.schemas)).toEqual(
+      expect.arrayContaining(['Invoice', 'CreateInvoiceBody', 'FundInvoiceBody', 'InvoiceIdParam', 'ListInvoicesQuery', 'ErrorResponse']),
+    );
+  });
+
+  test('POST /api/invoices with an unknown field returns 400', async () => {
+    const res = await request(app)
+      .post('/api/invoices')
+      .send({ sme: 'A', debtor: 'B', amount: 5, dueDate: '2027-01-01', isAdmin: true });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('VALIDATION_FAILED');
+    expect(store.list()).toHaveLength(4);
+  });
+
+  test('POST /api/invoices/:id/fund with an unknown field returns 400', async () => {
+    const res = await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 10, investor: INVESTOR, extra: 'bad' });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('VALIDATION_FAILED');
+    expect(store.get('INV_0002').fundedAmount).toBe(18000);
+  });
+
+  test.each(['/api/invoices', '/api/invoices/INV_0001/fund'])('POST %s with text/plain returns 415', async (url) => {
+    const res = await request(app).post(url).set('Content-Type', 'text/plain').send('amount=100');
+    expect(res.status).toBe(415);
+    expect(res.body.code).toBe('UNSUPPORTED_MEDIA_TYPE');
+  });
+
+  test('a 1 KB :id returns 400 on read and fund', async () => {
+    const longId = 'A'.repeat(1024);
+    const read = await request(app).get(`/api/invoices/${longId}`);
+    expect(read.status).toBe(400);
+    expect(read.body.code).toBe('VALIDATION_FAILED');
+    const fund = await request(app).post(`/api/invoices/${longId}/fund`).send({ amount: 100, investor: INVESTOR });
+    expect(fund.status).toBe(400);
+    expect(fund.body.errors.map((e) => e.path)).toContain('id');
+  });
+
+  test('errors[] carries path, message and code for each invalid field; details stays a string array', async () => {
+    const res = await request(app).post('/api/invoices').send({ sme: '', debtor: 123, amount: -1, dueDate: 'not-a-date' });
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('VALIDATION_FAILED');
+    for (const e of res.body.errors) {
+      expect(typeof e.path).toBe('string');
+      expect(typeof e.message).toBe('string');
+      expect(typeof e.code).toBe('string');
+    }
+    expect(res.body.errors.map((e) => e.path)).toEqual(expect.arrayContaining(['sme', 'debtor', 'amount', 'dueDate']));
+    expect(res.body.details.every((d) => typeof d === 'string')).toBe(true);
+    expect(res.body.details).toContain('amount must be a positive number');
+  });
+
+  test('field rules and defaults are preserved (trim, uppercase currency, yieldBps 800)', async () => {
+    const res = await request(app)
+      .post('/api/invoices')
+      .send({ sme: '  Trim SME  ', debtor: ' Buyer ', amount: 10, currency: 'usdc', dueDate: '2027-01-01' });
+    expect(res.status).toBe(201);
+    expect(res.body.data).toMatchObject({ sme: 'Trim SME', debtor: 'Buyer', currency: 'USDC', yieldBps: 800, smeAddress: null });
+    const tooLong = await request(app).post('/api/invoices').send({ sme: 'x'.repeat(121), debtor: 'B', amount: 10, dueDate: '2027-01-01' });
+    expect(tooLong.status).toBe(400);
+    const tooBig = await request(app).post('/api/invoices').send({ sme: 'A', debtor: 'B', amount: 1e12 + 1, dueDate: '2027-01-01' });
+    expect(tooBig.status).toBe(400);
+  });
+
+  test('validateInvoice export still works', () => {
+    const { validateInvoice } = require('../src/routes/invoices');
+    expect(validateInvoice({ sme: 'A', debtor: 'B', amount: 5, dueDate: '2027-01-01' }).value).toMatchObject({ yieldBps: 800, currency: 'USDC' });
+    expect(validateInvoice({}).errors.length).toBeGreaterThan(0);
+  });
+
+  test('GET /openapi.json is a valid OpenAPI 3 document', async () => {
+    const res = await request(app).get('/openapi.json');
+    await expect(SwaggerParser.validate(res.body)).resolves.toBeDefined();
   });
 });

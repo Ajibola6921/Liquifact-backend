@@ -142,7 +142,7 @@ describe('recording mutations', () => {
     const created = await request(app).post('/api/invoices').send(NEW_INVOICE);
     expect(Object.keys(created.body)).toEqual(['data']);
     const bad = await request(app).post('/api/invoices').send({});
-    expect(Object.keys(bad.body).sort()).toEqual(['details', 'error']);
+    expect(Object.keys(bad.body).sort()).toEqual(['code', 'details', 'error', 'errors']);
     const funded = await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 1, investor: INVESTOR });
     expect(Object.keys(funded.body)).toEqual(['data']);
   });

@@ -10,6 +10,8 @@ const { toMinor, fromMinor, couponMinor, daysBetween, annualisedBps } = require(
 const { parseInvoiceQuery, queryInvoices, InvoiceQueryError } = require('../services/invoice-query');
 const { requireAdminToken } = require('../middleware/require-admin-token');
 const escrowReader = require('./escrow');
+const { CreateInvoiceBody, FundInvoiceBodyShape, InvoiceIdParam } = require('../schemas');
+const { validate } = require('../middleware/validate');
 
 const router = express.Router();
 router.use(auditContext());
@@ -28,60 +30,43 @@ function present(invoice) {
 }
 
 /**
- * Validates a create-invoice payload.
+ * Maps a parsed CreateInvoiceBody to the stored invoice fields (trim,
+ * uppercase currency, defaults: yieldBps 800, currency USDC).
+ *
+ * @param {object} d parsed CreateInvoiceBody
+ * @returns {object} invoice fields
+ */
+function toInvoiceValue(d) {
+  const invoiceNumber = typeof d.invoiceNumber === 'string' ? d.invoiceNumber.trim() : undefined;
+  return {
+    sme: d.sme.trim(),
+    debtor: d.debtor.trim(),
+    ...(invoiceNumber ? { invoiceNumber } : {}),
+    smeAddress: typeof d.smeAddress === 'string' ? d.smeAddress : null,
+    amount: d.amount,
+    currency: typeof d.currency === 'string' ? d.currency.toUpperCase().slice(0, 12) : 'USDC',
+    yieldBps: d.yieldBps == null ? 800 : d.yieldBps,
+    dueDate: d.dueDate,
+    confirmNotDuplicate: d.confirmNotDuplicate === true,
+  };
+}
+
+/**
+ * Validates a create-invoice payload (backward-compatible wrapper around the
+ * CreateInvoiceBody zod schema).
  *
  * @param {object} body request body
  * @returns {{ value?: object, errors?: string[] }} validated fields or errors
  */
 function validateInvoice(body) {
-  const errors = [];
-  const b = body || {};
-  const str = (k, max = 120) => {
-    if (typeof b[k] !== 'string' || !b[k].trim() || b[k].length > max) {
-      errors.push(`${k} must be a non-empty string (max ${max} chars)`);
-    }
-  };
-  str('sme');
-  str('debtor');
-  if (typeof b.sme === 'string' && b.sme.trim() && !store.normalizeIdentity(b.sme)) {
-    errors.push('sme must contain letters or numbers');
+  const result = CreateInvoiceBody.safeParse(body || {});
+  if (!result.success) {
+    return { errors: [...new Set(result.error.issues.map((i) => i.message))] };
   }
-  if (typeof b.debtor === 'string' && b.debtor.trim() && !store.normalizeIdentity(b.debtor)) {
-    errors.push('debtor must contain letters or numbers');
-  }
-  const invoiceNumber = typeof b.invoiceNumber === 'string' ? b.invoiceNumber.trim() : undefined;
-  if (b.invoiceNumber !== undefined
-    && (!invoiceNumber || invoiceNumber.length > 64 || !/^[A-Za-z0-9._/-]{1,64}$/.test(invoiceNumber))) {
-    errors.push('invoiceNumber must be 1-64 characters using letters, digits, ., _, /, or -');
-  }
-  if (typeof b.amount !== 'number' || !(b.amount > 0) || b.amount > 1e12) {
-    errors.push('amount must be a positive number');
-  }
-  const yieldBps = b.yieldBps == null ? 800 : b.yieldBps;
-  if (!Number.isInteger(yieldBps) || yieldBps < 0 || yieldBps > 10000) {
-    errors.push('yieldBps must be an integer between 0 and 10000');
-  }
-  const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
-  if (!ISO_DATE.test(b.dueDate) || Number.isNaN(Date.parse(b.dueDate))) {
-    errors.push('dueDate must be an ISO date (YYYY-MM-DD)');
-  }
-  if (errors.length) {
-    return { errors };
-  }
-  return {
-    value: {
-      sme: b.sme.trim(),
-      debtor: b.debtor.trim(),
-      ...(invoiceNumber ? { invoiceNumber } : {}),
-      smeAddress: typeof b.smeAddress === 'string' ? b.smeAddress : null,
-      amount: b.amount,
-      currency: typeof b.currency === 'string' ? b.currency.toUpperCase().slice(0, 12) : 'USDC',
-      yieldBps,
-      dueDate: b.dueDate,
-      confirmNotDuplicate: b.confirmNotDuplicate === true,
-    },
-  };
+  return { value: toInvoiceValue(result.data) };
 }
+
+const idParam = (audit) => validate({ params: InvoiceIdParam, audit });
 
 router.get('/', (req, res) => {
   try {
@@ -96,7 +81,7 @@ router.get('/', (req, res) => {
   }
 });
 
-router.get('/:id', (req, res) => {
+router.get('/:id', idParam(), (req, res) => {
   const invoice = store.get(req.params.id);
   if (!invoice) {
     return res.status(404).json({ error: 'Invoice not found' });
@@ -104,7 +89,7 @@ router.get('/:id', (req, res) => {
   return res.json({ data: present(invoice) });
 });
 
-router.get('/:id/quote', (req, res) => {
+router.get('/:id/quote', idParam(), (req, res) => {
   const invoice = store.get(req.params.id);
   if (!invoice) {
     return res.status(404).json({ error: 'INVOICE_NOT_FOUND', code: 'INVOICE_NOT_FOUND' });
@@ -159,18 +144,8 @@ router.get('/:id/quote', (req, res) => {
   });
 });
 
-router.post('/', (req, res) => {
-  const { value, errors } = validateInvoice(req.body);
-  if (errors) {
-    req.audit({
-      action: 'invoice.create',
-      resourceType: 'invoice',
-      outcome: 'rejected',
-      statusCode: 400,
-      metadata: { errors },
-    });
-    return res.status(400).json({ error: 'Validation failed', details: errors });
-  }
+router.post('/', validate({ body: CreateInvoiceBody, audit: 'invoice.create' }), (req, res) => {
+  const value = toInvoiceValue(req.validatedBody);
   let invoice;
   try {
     invoice = store.create(value);
@@ -198,7 +173,7 @@ router.post('/', (req, res) => {
   return res.status(201).json({ data: present(invoice) });
 });
 
-router.post('/:id/fund', (req, res) => {
+router.post('/:id/fund', validate({ params: InvoiceIdParam, body: FundInvoiceBodyShape, audit: 'invoice.fund' }), (req, res) => {
   const record = (details) =>
     req.audit({ action: 'invoice.fund', resourceType: 'invoice', resourceId: req.params.id, ...details });
   const reject = (statusCode, error, details, extra = {}) => {
@@ -267,7 +242,7 @@ router.post('/:id/fund', (req, res) => {
   return res.json({ data: present(updated) });
 });
 
-router.get('/:id/contributions', (req, res) => {
+router.get('/:id/contributions', idParam(), (req, res) => {
   const invoice = store.get(req.params.id);
   if (!invoice) {
     return res.status(404).json({ error: 'Invoice not found' });
@@ -339,7 +314,7 @@ function transitionAudit(req, res, action) {
   };
 }
 
-router.post('/:id/settle', (req, res) => {
+router.post('/:id/settle', idParam('invoice.settle'), (req, res) => {
   const audit = transitionAudit(req, res, 'invoice.settle');
   const invoice = store.get(req.params.id);
   if (!invoice) {
@@ -352,7 +327,7 @@ router.post('/:id/settle', (req, res) => {
   return audit.success(before, store.settle(invoice));
 });
 
-router.post('/:id/cancel', (req, res) => {
+router.post('/:id/cancel', idParam('invoice.cancel'), (req, res) => {
   const audit = transitionAudit(req, res, 'invoice.cancel');
   const invoice = store.get(req.params.id);
   if (!invoice) {
@@ -454,7 +429,7 @@ async function readEscrow(contractId) {
   return result ? result.native : result;
 }
 
-router.post('/:id/escrow', requireAdminToken, async (req, res) => {
+router.post('/:id/escrow', requireAdminToken, idParam(), async (req, res) => {
   const { contractId } = req.body || {};
   if (typeof contractId !== 'string' || !StrKey.isValidContract(contractId)) {
     return res.status(400).json({ code: 'INVALID_CONTRACT_ID', error: 'Invalid Stellar contract ID' });
@@ -506,7 +481,7 @@ router.post('/:id/escrow', requireAdminToken, async (req, res) => {
   return res.json({ data: present(invoice) });
 });
 
-router.get('/:id/escrow', async (req, res) => {
+router.get('/:id/escrow', idParam(), async (req, res) => {
   const invoice = store.get(req.params.id);
   if (!invoice) {
     return res.status(404).json({ code: 'INVOICE_NOT_FOUND', error: 'Invoice not found' });

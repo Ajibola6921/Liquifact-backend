@@ -3,27 +3,17 @@
 const config = require('./config');
 const { SORTS } = require('./services/invoice-query');
 
-const Invoice = {
-  type: 'object',
-  properties: {
-    id: { type: 'string', pattern: '^[A-Za-z0-9_]{1,32}$', example: 'INV_0001' },
-    invoiceNumber: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._/-]{1,64}$', example: 'ACME-2027-001' },
-    sme: { type: 'string', example: 'Acme Components Ltd' },
-    smeAddress: { type: 'string', nullable: true },
-    debtor: { type: 'string', example: 'Globex Retail' },
-    amount: { type: 'number', example: 25000 },
-    currency: { type: 'string', example: 'USDC' },
-    fundedAmount: { type: 'number', example: 0 },
-    remainingCapacity: { type: 'number', example: 25000, description: 'amount - fundedAmount (computed)' },
-    yieldBps: { type: 'integer', example: 800 },
-    dueDate: { type: 'string', format: 'date' },
-    status: { type: 'string', enum: ['open', 'funded', 'settled', 'cancelled'] },
-    escrowContractId: { type: 'string', nullable: true, description: 'Verified linked escrow contract (null when off-chain)' },
-    onChain: { type: 'boolean', readOnly: true, description: 'Derived from escrowContractId !== null' },
-    createdAt: { type: 'string', format: 'date-time' },
-    duplicateOverride: { type: 'boolean', example: false },
-  },
-};
+const { OpenApiGeneratorV3 } = require('@asteasolutions/zod-to-openapi');
+const { registry } = require('./schemas');
+
+/**
+ * Component schemas generated once from the zod registry (src/schemas), the
+ * same schemas the routes validate with, so docs cannot drift from behaviour.
+ */
+const GENERATED_SCHEMAS = new OpenApiGeneratorV3(registry.definitions).generateComponents().components.schemas;
+
+const ref = (name) => ({ $ref: `#/components/schemas/${name}` });
+const Invoice = ref('Invoice');
 
 const FundingError = {
   type: 'object',
@@ -35,19 +25,8 @@ const FundingError = {
   },
 };
 
-const FundRequest = {
-  type: 'object',
-  required: ['amount', 'investor'],
-  properties: {
-    amount: { type: 'number', example: 7000, description: 'Positive finite amount not exceeding the invoice face value' },
-    investor: { type: 'string', example: 'GA7TXEBMEPQCLHIYCWDN7RKAO5IMRD2UV7O7TZXMEW6VZUMEXNR4XBB5' },
-    allowPartial: {
-      type: 'boolean',
-      default: false,
-      description: 'When true, the contribution is capped at remainingCapacity and the response reports accepted/rejected',
-    },
-  },
-};
+/** Fund request body, generated from the FundInvoiceBody zod schema. */
+const FundRequest = GENERATED_SCHEMAS.FundInvoiceBody;
 
 const FundResponse = {
   type: 'object',
@@ -305,6 +284,10 @@ const adminErrors = {
   503: { description: 'ADMIN_API_TOKEN is not configured on the server', ...json(ErrorBody) },
 };
 
+// Built documents are memoised per base URL (bounded, since the base URL can come from the Host header).
+const SPEC_CACHE_LIMIT = 16;
+const specCache = new Map();
+
 /**
  * Builds the OpenAPI document for the given public base URL.
  *
@@ -312,6 +295,24 @@ const adminErrors = {
  * @returns {object} OpenAPI 3.0 document
  */
 function buildSpec(baseUrl) {
+  if (specCache.has(baseUrl)) {
+    return specCache.get(baseUrl);
+  }
+  const spec = createSpec(baseUrl);
+  if (specCache.size >= SPEC_CACHE_LIMIT) {
+    specCache.delete(specCache.keys().next().value);
+  }
+  specCache.set(baseUrl, spec);
+  return spec;
+}
+
+/**
+ * Creates the OpenAPI document for the given public base URL.
+ *
+ * @param {string} baseUrl server URL to advertise
+ * @returns {object} OpenAPI 3.0 document
+ */
+function createSpec(baseUrl) {
   return {
     openapi: '3.0.3',
     info: {
@@ -339,7 +340,7 @@ function buildSpec(baseUrl) {
         },
       },
       schemas: {
-        Invoice,
+        ...GENERATED_SCHEMAS,
         FundingError,
         FundRequest,
         FundResponse,
@@ -440,31 +441,12 @@ function buildSpec(baseUrl) {
           tags: ['Invoices'],
           summary: 'Submit an invoice for financing',
           description: 'Every attempt, accepted or rejected, is recorded in the audit log as `invoice.create`.',
-          requestBody: {
-            required: true,
-            ...json({
-              type: 'object',
-              required: ['sme', 'debtor', 'amount', 'dueDate'],
-              properties: {
-                sme: { type: 'string' },
-                debtor: { type: 'string' },
-                invoiceNumber: { type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9._/-]{1,64}$' },
-                confirmNotDuplicate: {
-                  type: 'boolean',
-                  description: 'Explicitly permits a possible duplicate; never bypasses an exact invoice-number duplicate.',
-                },
-                amount: { type: 'number' },
-                currency: { type: 'string', default: 'USDC' },
-                yieldBps: { type: 'integer', default: 800 },
-                dueDate: { type: 'string', format: 'date' },
-                smeAddress: { type: 'string' },
-              },
-            }),
-          },
+          requestBody: { required: true, ...json(GENERATED_SCHEMAS.CreateInvoiceBody) },
           responses: {
             201: { description: 'Created', ...json({ type: 'object', properties: { data: Invoice } }) },
-            400: { description: 'Validation failed', ...json(ErrorBody) },
+            400: { description: 'Validation failed (VALIDATION_FAILED, unknown keys rejected)', ...json(ref('ErrorResponse')) },
             409: { description: 'Duplicate invoice or possible duplicate receivable', ...json(DuplicateError) },
+            415: { description: 'Content-Type must be application/json (UNSUPPORTED_MEDIA_TYPE)', ...json(ref('ErrorResponse')) },
           },
         },
       },
@@ -472,9 +454,10 @@ function buildSpec(baseUrl) {
         get: {
           tags: ['Invoices'],
           summary: 'Get an invoice',
-          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          parameters: [{ name: 'id', in: 'path', required: true, schema: GENERATED_SCHEMAS.InvoiceIdParam.properties.id }],
           responses: {
             200: { description: 'Invoice', ...json({ type: 'object', properties: { data: Invoice } }) },
+            400: { description: 'Invalid id (VALIDATION_FAILED)', ...json(ref('ErrorResponse')) },
             404: { description: 'Not found', ...json(ErrorBody) },
           },
         },
@@ -523,9 +506,14 @@ function buildSpec(baseUrl) {
           requestBody: { required: true, ...json(FundRequest) },
           responses: {
             200: { description: 'Updated invoice', ...json(FundResponse) },
-            400: { description: 'Invalid amount (non-finite, non-positive, above face value) or missing/invalid investor', ...json(FundingError) },
+            400: {
+              description: 'Invalid amount (non-finite, non-positive, above face value), missing/invalid investor, ' +
+                'unknown body key or invalid id (VALIDATION_FAILED)',
+              ...json(FundingError),
+            },
             404: { description: 'Not found', ...json(ErrorBody) },
             409: { description: 'Invoice not open', ...json(ErrorBody) },
+            415: { description: 'Content-Type must be application/json (UNSUPPORTED_MEDIA_TYPE)', ...json(ref('ErrorResponse')) },
             422: { description: 'Contribution exceeds remaining capacity, or self-funding not allowed', ...json(FundingError) },
           },
         },
