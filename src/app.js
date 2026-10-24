@@ -59,6 +59,7 @@ const ENDPOINTS = [
   { method: 'GET', path: '/api/invoices/:id/document/meta', description: 'Invoice document metadata + attestation hash' },
   { method: 'GET', path: '/api/escrow', description: 'Deployed Soroban escrow contract metadata' },
   { method: 'GET', path: '/api/escrow/live', description: 'Live escrow state from Soroban RPC' },
+  { method: 'GET', path: '/api/escrow/investors/:address', description: 'On-chain investor escrow position' },
   { method: 'GET', path: '/api/escrow/attestations', description: 'On-chain attestation log (paginated)' },
   { method: 'POST', path: '/api/escrow/attestations/verify', description: 'Verify a document digest against on-chain attestations' },
   { method: 'GET', path: '/api/escrow/events', description: 'Query decoded escrow contract events (paginated)' },

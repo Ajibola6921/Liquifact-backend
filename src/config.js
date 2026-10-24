@@ -180,6 +180,12 @@ function loadConfig(env = process.env) {
     errors.push(`ESCROW_CONTRACT_ID must be a valid Stellar contract address starting with 'C' (got "${contractId}")`);
   }
 
+  // Source account used to build read-only Soroban simulations (never signs or submits).
+  const simulationSourceAccount = env.SIMULATION_SOURCE_ACCOUNT || 'GA7TXEBMEPQCLHIYCWDN7RKAO5IMRD2UV7O7TZXMEW6VZUMEXNR4XBB5';
+  if (!StrKey.isValidEd25519PublicKey(simulationSourceAccount)) {
+    errors.push(`SIMULATION_SOURCE_ACCOUNT must be a valid Stellar G-address (got "${simulationSourceAccount}")`);
+  }
+
   // Explorer URL derived
   let explorerUrl = '';
   if (explorerBaseUrl && contractId) {
@@ -255,6 +261,7 @@ function loadConfig(env = process.env) {
     rpcUrl,
     networkPassphrase,
     contractId,
+    simulationSourceAccount,
     explorerUrl,
     frontendUrl,
     publicApiBaseUrl,
