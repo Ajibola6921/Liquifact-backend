@@ -13,6 +13,19 @@ const router = express.Router();
 router.use(auditContext());
 
 /**
+ * Adds the computed remainingCapacity field to an invoice representation.
+ *
+ * @param {object} invoice invoice record
+ * @returns {object} invoice with remainingCapacity
+ */
+function present(invoice) {
+  if (!invoice) {
+    return invoice;
+  }
+  return { ...invoice, remainingCapacity: store.remaining(invoice) };
+}
+
+/**
  * Validates a create-invoice payload.
  *
  * @param {object} body request body
@@ -58,7 +71,8 @@ function validateInvoice(body) {
 router.get('/', (req, res) => {
   try {
     const query = parseInvoiceQuery(req.query);
-    return res.json(queryInvoices(store.list(), query));
+    const page = queryInvoices(store.list(), query);
+    return res.json({ ...page, data: page.data.map(present) });
   } catch (error) {
     if (!(error instanceof InvoiceQueryError)) {
       throw error;
@@ -72,7 +86,7 @@ router.get('/:id', (req, res) => {
   if (!invoice) {
     return res.status(404).json({ error: 'Invoice not found' });
   }
-  return res.json({ data: invoice });
+  return res.json({ data: present(invoice) });
 });
 
 router.get('/:id/quote', (req, res) => {
@@ -151,22 +165,23 @@ router.post('/', (req, res) => {
     statusCode: 201,
     after: invoice,
   });
-  return res.status(201).json({ data: invoice });
+  return res.status(201).json({ data: present(invoice) });
 });
 
 router.post('/:id/fund', (req, res) => {
   const record = (details) =>
     req.audit({ action: 'invoice.fund', resourceType: 'invoice', resourceId: req.params.id, ...details });
-  const reject = (statusCode, error, details) => {
+  const reject = (statusCode, error, details, extra = {}) => {
     record({ outcome: 'rejected', statusCode, metadata: { error, ...details.metadata }, before: details.before });
-    return res.status(statusCode).json({ error });
+    return res.status(statusCode).json({ error, ...extra });
   };
 
   const invoice = store.get(req.params.id);
   if (!invoice) {
     return reject(404, 'Invoice not found', {});
   }
-  const { amount, investor } = req.body || {};
+  const body = req.body || {};
+  const { amount, investor } = body;
   const before = { fundedAmount: invoice.fundedAmount, status: invoice.status };
   const requested = {
     requestedAmount: typeof amount === 'number' && Number.isFinite(amount) ? amount : null,
@@ -181,8 +196,13 @@ router.post('/:id/fund', (req, res) => {
   if (invoice.smeAddress && investor === invoice.smeAddress) {
     return reject(422, 'SELF_FUNDING_NOT_ALLOWED', { before, metadata: requested });
   }
-  if (typeof amount !== 'number' || !(amount > 0) || !Number.isFinite(amount)) {
-    return reject(400, 'amount must be a positive number', { before, metadata: requested });
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || !(amount > 0)) {
+    return reject(400, 'amount must be a positive finite number', { before, metadata: requested }, { code: 'INVALID_AMOUNT' });
+  }
+  if (amount > invoice.amount) {
+    return reject(400, 'amount must not exceed the invoice face value', { before, metadata: requested }, {
+      code: 'INVALID_AMOUNT',
+    });
   }
   if (invoice.status !== 'open') {
     return reject(409, `Invoice is ${invoice.status}; only open invoices can be funded`, {
@@ -190,15 +210,31 @@ router.post('/:id/fund', (req, res) => {
       metadata: requested,
     });
   }
-  const updated = store.fund(invoice, amount, investor);
+
+  // Contributions are accepted in full or rejected; allowPartial explicitly caps at remaining capacity.
+  const remainingCapacity = store.remaining(invoice);
+  let accepted = amount;
+  if (amount > remainingCapacity) {
+    if (body.allowPartial !== true) {
+      return reject(422, 'Contribution exceeds remaining capacity', {
+        before,
+        metadata: { ...requested, remainingCapacity },
+      }, { code: 'FUNDING_EXCEEDS_CAPACITY', remainingCapacity });
+    }
+    accepted = remainingCapacity;
+  }
+  const updated = store.fund(invoice, accepted, investor);
   record({
     outcome: 'success',
     statusCode: 200,
     before,
     after: { fundedAmount: updated.fundedAmount, status: updated.status },
-    metadata: requested,
+    metadata: accepted === amount ? requested : { ...requested, accepted, rejected: amount - accepted },
   });
-  return res.json({ data: updated });
+  if (accepted !== amount) {
+    return res.json({ data: present(updated), accepted, rejected: amount - accepted });
+  }
+  return res.json({ data: present(updated) });
 });
 
 router.get('/:id/contributions', (req, res) => {

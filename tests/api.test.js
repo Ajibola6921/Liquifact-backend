@@ -40,6 +40,20 @@ describe('system', () => {
     expect(Object.keys(spec.body.paths)).toContain('/api/invoices');
   });
 
+  test('openapi documents funding contract', async () => {
+    const spec = await request(app).get('/openapi.json');
+    const fund = spec.body.paths['/api/invoices/{id}/fund'].post;
+    expect(fund).toBeDefined();
+    expect(fund.responses['422']).toBeDefined();
+    expect(fund.responses['400']).toBeDefined();
+    expect(fund.requestBody.content['application/json'].schema.properties.allowPartial).toBeDefined();
+    const schemas = spec.body.components.schemas;
+    expect(schemas.Invoice.properties.remainingCapacity).toBeDefined();
+    expect(schemas.FundingError).toBeDefined();
+    expect(schemas.FundRequest).toBeDefined();
+    expect(schemas.FundResponse).toBeDefined();
+  });
+
   test('unknown route is a JSON 404', async () => {
     const res = await request(app).get('/nope');
     expect(res.status).toBe(404);
@@ -56,6 +70,14 @@ describe('invoices', () => {
     expect(bad.status).toBe(400);
   });
 
+  test('remainingCapacity is present in list and detail', async () => {
+    const list = await request(app).get('/api/invoices');
+    const inv = list.body.data.find((i) => i.id === 'INV_0002');
+    expect(inv.remainingCapacity).toBe(7000);
+    const detail = await request(app).get('/api/invoices/INV_0002');
+    expect(detail.body.data.remainingCapacity).toBe(7000);
+  });
+
   test('get by id', async () => {
     expect((await request(app).get('/api/invoices/INV_0001')).status).toBe(200);
     expect((await request(app).get('/api/invoices/missing')).status).toBe(404);
@@ -69,6 +91,7 @@ describe('invoices', () => {
       .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
     expect(ok.status).toBe(201);
     expect(ok.body.data.status).toBe('open');
+    expect(ok.body.data.remainingCapacity).toBe(500);
   });
 
   test('fund moves invoice to funded when target reached', async () => {
@@ -76,8 +99,63 @@ describe('invoices', () => {
     const res = await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 7000, investor });
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('funded');
+    expect(res.body.data.remainingCapacity).toBe(0);
     const again = await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 1, investor });
     expect(again.status).toBe(409);
+  });
+
+  describe('over-funding', () => {
+    const investor = 'GBTUJNOF2WAAUPKCJHBB76ID5HGN6KMTUG43F3Z344T7QRTP7B7TVPVC';
+
+    test('rejects over-funding with 422 and does not mutate', async () => {
+      const res = await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 20000, investor });
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe('FUNDING_EXCEEDS_CAPACITY');
+      expect(res.body.remainingCapacity).toBe(7000);
+      const after = await request(app).get('/api/invoices/INV_0002');
+      expect(after.body.data.fundedAmount).toBe(18000);
+      expect(after.body.data.status).toBe('open');
+    });
+
+    test('allowPartial caps contribution and reports split', async () => {
+      const res = await request(app)
+        .post('/api/invoices/INV_0002/fund')
+        .send({ amount: 20000, investor, allowPartial: true });
+      expect(res.status).toBe(200);
+      expect(res.body.accepted).toBe(7000);
+      expect(res.body.rejected).toBe(13000);
+      expect(res.body.data.fundedAmount).toBe(25000);
+      expect(res.body.data.status).toBe('funded');
+      expect(res.body.data.remainingCapacity).toBe(0);
+    });
+
+    test('rejects invalid amounts (non-positive, non-finite, above face value, non-number) with 400', async () => {
+      for (const amount of [0, -1, 1e308, 25001, '100']) {
+        const res = await request(app).post('/api/invoices/INV_0002/fund').send({ amount, investor });
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('INVALID_AMOUNT');
+      }
+      expect(store.get('INV_0002').fundedAmount).toBe(18000);
+    });
+
+    test('an amount just above remaining capacity is rejected with 422', async () => {
+      const res = await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 7001, investor });
+      expect(res.status).toBe(422);
+      expect(res.body.code).toBe('FUNDING_EXCEEDS_CAPACITY');
+    });
+
+    test('rejects funding a non-open invoice with 409', async () => {
+      await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 7000, investor });
+      const res = await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 1, investor });
+      expect(res.status).toBe(409);
+    });
+  });
+
+  test('store.fund throws when called over capacity and does not mutate', () => {
+    const invoice = store.get('INV_0002');
+    expect(() => store.fund(invoice, 100000, 'GBTUJNOF2WAAUPKCJHBB76ID5HGN6KMTUG43F3Z344T7QRTP7B7TVPVC')).toThrow();
+    expect(invoice.fundedAmount).toBe(18000);
+    expect(invoice.status).toBe('open');
   });
 
   test('create rejects non-ISO dueDate', async () => {
@@ -102,7 +180,7 @@ describe('invoices', () => {
 
   test('settle moves funded invoice to settled', async () => {
     const investor = 'GBTUJNOF2WAAUPKCJHBB76ID5HGN6KMTUG43F3Z344T7QRTP7B7TVPVC';
-    await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 25000, investor });
+    await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 7000, investor });
     const res = await request(app).post('/api/invoices/INV_0002/settle');
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('settled');
@@ -121,7 +199,7 @@ describe('invoices', () => {
 
   test('cancel moves funded invoice to cancelled', async () => {
     const investor = 'GBTUJNOF2WAAUPKCJHBB76ID5HGN6KMTUG43F3Z344T7QRTP7B7TVPVC';
-    await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 25000, investor });
+    await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 7000, investor });
     const res = await request(app).post('/api/invoices/INV_0002/cancel');
     expect(res.status).toBe(200);
     expect(res.body.data.status).toBe('cancelled');
@@ -129,7 +207,7 @@ describe('invoices', () => {
 
   test('cancel rejects settled invoice', async () => {
     const investor = 'GBTUJNOF2WAAUPKCJHBB76ID5HGN6KMTUG43F3Z344T7QRTP7B7TVPVC';
-    await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 25000, investor });
+    await request(app).post('/api/invoices/INV_0002/fund').send({ amount: 7000, investor });
     await request(app).post('/api/invoices/INV_0002/settle');
     const res = await request(app).post('/api/invoices/INV_0002/cancel');
     expect(res.status).toBe(409);
