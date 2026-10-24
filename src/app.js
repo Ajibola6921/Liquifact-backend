@@ -49,6 +49,9 @@ const ENDPOINTS = [
   { method: 'POST', path: '/api/invoices/:id/fund', description: 'Record an investor contribution' },
   { method: 'GET', path: '/api/invoices/:id/contributions', description: 'List contributions for an invoice' },
   { method: 'GET', path: '/api/investors/:address/portfolio', description: 'Investor portfolio summary and expected returns' },
+  { method: 'POST', path: '/api/invoices/:id/document', description: 'Upload invoice PDF document' },
+  { method: 'GET', path: '/api/invoices/:id/document', description: 'Download invoice PDF document' },
+  { method: 'GET', path: '/api/invoices/:id/document/meta', description: 'Invoice document metadata + attestation hash' },
   { method: 'GET', path: '/api/escrow', description: 'Deployed Soroban escrow contract metadata' },
   { method: 'GET', path: '/api/escrow/live', description: 'Live escrow state from Soroban RPC' },
   { method: 'GET', path: '/api/escrow/attestations', description: 'On-chain attestation log (paginated)' },
@@ -104,6 +107,7 @@ app.get('/api/stats', (req, res) => {
 
 app.use('/api/invoices', require('./routes/invoices'));
 app.use('/api/investors', require('./routes/investors'));
+app.use('/api/invoices/:id/document', require('./routes/invoiceDocument'));
 app.use('/api/escrow', require('./routes/escrow'));
 
 app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.path, docs: '/docs' }));

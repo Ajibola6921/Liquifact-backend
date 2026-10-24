@@ -22,7 +22,17 @@ const Invoice = {
 };
 
 const json = (schema) => ({ content: { 'application/json': { schema } } });
-const ErrorBody = { type: 'object', properties: { error: { type: 'string' } } };
+const ErrorBody = { type: 'object', properties: { error: { type: 'string' }, detail: { type: 'string' } } };
+
+const DocumentMeta = {
+  type: 'object',
+  properties: {
+    sha256Hex: { type: 'string', description: 'SHA-256 hex digest of the PDF bytes', example: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' },
+    sizeBytes: { type: 'integer', description: 'File size in bytes', example: 12345 },
+    uploadedAt: { type: 'string', format: 'date-time', description: 'ISO 8601 upload timestamp' },
+    originalName: { type: 'string', description: 'Sanitised original filename (≤120 chars)', example: 'invoice-001.pdf' },
+  },
+};
 
 /** Raw stroop amount as a decimal integer string (7 decimals). */
 const StroopString = { type: 'string', pattern: '^\\d+$', example: '1000000000' };
@@ -379,6 +389,103 @@ function buildSpec(baseUrl) {
               }),
             },
             400: { description: 'Invalid investor address', ...json(ErrorBody) },
+          },
+        },
+      },
+      '/api/invoices/{id}/document': {
+        post: {
+          tags: ['Invoices'],
+          summary: 'Upload a PDF document for an invoice',
+          description:
+            'Accepts a single `multipart/form-data` upload with field name `file`. ' +
+            'Validates PDF magic bytes (`%PDF-` header and `%%EOF` trailer) and rejects unsafe ' +
+            'PDFs containing `/JavaScript` or `/Launch` actions. Computes a SHA-256 digest. ' +
+            'Only allowed while the invoice is `open` and has no document yet.',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Invoice ID' }],
+          requestBody: {
+            required: true,
+            content: {
+              'multipart/form-data': {
+                schema: {
+                  type: 'object',
+                  required: ['file'],
+                  properties: {
+                    file: { type: 'string', format: 'binary', description: 'The PDF file (max 5 MiB)' },
+                  },
+                },
+              },
+            },
+          },
+          responses: {
+            201: {
+              description: 'Document accepted; returns metadata including SHA-256 digest',
+              ...json({
+                type: 'object',
+                properties: {
+                  data: DocumentMeta,
+                },
+              }),
+            },
+            400: { description: 'Missing or extra file field', ...json(ErrorBody) },
+            404: { description: 'Invoice not found', ...json(ErrorBody) },
+            409: { description: 'Invoice not open or document already exists', ...json(ErrorBody) },
+            413: { description: 'File exceeds the 5 MiB limit', ...json(ErrorBody) },
+            415: { description: 'File is not a valid PDF (magic-byte check failed)', ...json(ErrorBody) },
+            422: { description: 'PDF contains unsafe actions (/JavaScript or /Launch)', ...json(ErrorBody) },
+          },
+        },
+        get: {
+          tags: ['Invoices'],
+          summary: 'Download the invoice PDF document',
+          description: 'Streams the stored PDF with correct security headers.',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Invoice ID' }],
+          responses: {
+            200: {
+              description: 'PDF binary stream',
+              headers: {
+                'Content-Disposition': { schema: { type: 'string' }, description: 'attachment; filename="<sanitised name>"' },
+                'X-Content-Type-Options': { schema: { type: 'string' }, description: 'nosniff' },
+                ETag: { schema: { type: 'string' }, description: '"<sha256Hex>"' },
+              },
+              content: { 'application/pdf': { schema: { type: 'string', format: 'binary' } } },
+            },
+            404: { description: 'Invoice or document not found', ...json(ErrorBody) },
+          },
+        },
+      },
+      '/api/invoices/{id}/document/meta': {
+        get: {
+          tags: ['Invoices'],
+          summary: 'Invoice document metadata + attestation hash',
+          description:
+            'Returns document metadata and `attestationHash` — the same SHA-256 hex ' +
+            'digest suitable for passing to `bind_primary_attestation_hash(digest: BytesN<32>)` on the Soroban escrow contract.',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: 'Invoice ID' }],
+          responses: {
+            200: {
+              description: 'Document metadata with on-chain attestation hash',
+              ...json({
+                type: 'object',
+                properties: {
+                  data: {
+                    allOf: [
+                      DocumentMeta,
+                      {
+                        type: 'object',
+                        properties: {
+                          attestationHash: {
+                            type: 'string',
+                            description: 'SHA-256 hex digest, same as sha256Hex; pass to bind_primary_attestation_hash',
+                            example: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+                          },
+                        },
+                      },
+                    ],
+                  },
+                },
+              }),
+            },
+            404: { description: 'Invoice or document not found', ...json(ErrorBody) },
           },
         },
       },
