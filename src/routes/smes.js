@@ -14,6 +14,7 @@ const express = require('express');
 const { createSme, getSme, updateSmeReview } = require('../data/smes');
 const { requireAdminToken, hasValidAdminToken } = require('../middleware/require-admin-token');
 const { validate } = require('../middleware/validate');
+const { requireRole } = require('../middleware/auth');
 const { CreateSmeRequest, ReviewSmeRequest } = require('../schemas');
 
 const router = express.Router();
@@ -40,7 +41,7 @@ function publicSme(record, includePii) {
   return publicRecord;
 }
 
-router.post('/', validate({ body: CreateSmeRequest }), (req, res) => {
+router.post('/', requireRole('sme', 'admin'), validate({ body: CreateSmeRequest }), (req, res) => {
   const body = req.validatedBody;
   try {
     const record = createSme({ ...body, country: body.country.toUpperCase() });

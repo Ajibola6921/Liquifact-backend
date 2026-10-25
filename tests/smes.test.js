@@ -1,5 +1,6 @@
 'use strict';
 
+const { authHeader } = require('./helpers/auth');
 const request = require('supertest');
 const app = require('../src/app');
 const store = require('../src/data/store');
@@ -46,7 +47,7 @@ describe('SME onboarding and invoice verification (#1557)', () => {
     }
   });
 
-  const createRecord = (overrides = {}) => request(app).post('/api/smes').send({ ...validSme, ...overrides });
+  const createRecord = (overrides = {}) => request(app).post('/api/smes').set(authHeader()).send({ ...validSme, ...overrides });
   const review = (id, decision, note, token = TOKEN) =>
     request(app).post(`/api/smes/${id}/review`).set('Authorization', `Bearer ${token}`).send({ decision, note });
 
@@ -86,7 +87,7 @@ describe('SME onboarding and invoice verification (#1557)', () => {
     test.each(['legalName', 'registrationNumber', 'country', 'stellarAddress', 'contactEmail'])('requires %s', async (field) => {
       const payload = { ...validSme };
       delete payload[field];
-      const response = await request(app).post('/api/smes').send(payload);
+      const response = await request(app).post('/api/smes').set(authHeader()).send(payload);
       expect(response.status).toBe(400);
       expect(response.body.errors.map((e) => e.path)).toContain(field);
     });
@@ -200,7 +201,7 @@ describe('SME onboarding and invoice verification (#1557)', () => {
     });
 
     test('requires smeId', async () => {
-      const response = await request(app).post('/api/invoices').send(validInvoice);
+      const response = await request(app).post('/api/invoices').set(authHeader()).send(validInvoice);
       expect(response.status).toBe(400);
       expect(response.body.code).toBe('SME_ID_REQUIRED');
     });
@@ -214,7 +215,7 @@ describe('SME onboarding and invoice verification (#1557)', () => {
       await review(suspended.id, 'suspend');
 
       for (const id of [pending.id, rejected.id, suspended.id]) {
-        const response = await request(app).post('/api/invoices').send({ ...validInvoice, smeId: id });
+        const response = await request(app).post('/api/invoices').set(authHeader()).send({ ...validInvoice, smeId: id });
         expect(response.status).toBe(403);
         expect(response.body.code).toBe('SME_NOT_VERIFIED');
       }
@@ -224,7 +225,7 @@ describe('SME onboarding and invoice verification (#1557)', () => {
     test('accepts verified SMEs and overrides client-supplied identity values', async () => {
       const created = (await createRecord()).body.data;
       await review(created.id, 'verify');
-      const response = await request(app).post('/api/invoices').send({
+      const response = await request(app).post('/api/invoices').set(authHeader()).send({
         ...validInvoice,
         smeId: created.id,
         sme: 'Impersonated Company',
@@ -243,25 +244,25 @@ describe('SME onboarding and invoice verification (#1557)', () => {
       await review(created.id, 'verify');
       const withoutSme = { ...validInvoice };
       delete withoutSme.sme;
-      const response = await request(app).post('/api/invoices').send({ ...withoutSme, smeId: created.id });
+      const response = await request(app).post('/api/invoices').set(authHeader()).send({ ...withoutSme, smeId: created.id });
       expect(response.status).toBe(201);
       expect(response.body.data.sme).toBe(validSme.legalName);
     });
 
     test('returns not found for an unknown smeId', async () => {
-      const response = await request(app).post('/api/invoices').send({ ...validInvoice, smeId: 'SME_missing' });
+      const response = await request(app).post('/api/invoices').set(authHeader()).send({ ...validInvoice, smeId: 'SME_missing' });
       expect(response.status).toBe(404);
       expect(response.body.code).toBe('SME_NOT_FOUND');
     });
   });
 
   test('keeps invoice creation unchanged when verification is disabled', async () => {
-    const response = await request(app).post('/api/invoices').send(validInvoice);
+    const response = await request(app).post('/api/invoices').set(authHeader()).send(validInvoice);
     expect(response.status).toBe(201);
     expect(response.body.data).toMatchObject({ sme: validInvoice.sme, status: 'open' });
     expect(response.body.data.smeId).toBeUndefined();
 
-    const missingSme = await request(app).post('/api/invoices').send({ debtor: 'B', amount: 5, dueDate: '2027-01-01' });
+    const missingSme = await request(app).post('/api/invoices').set(authHeader()).send({ debtor: 'B', amount: 5, dueDate: '2027-01-01' });
     expect(missingSme.status).toBe(400);
     expect(missingSme.body.errors.map((e) => e.path)).toContain('sme');
   });

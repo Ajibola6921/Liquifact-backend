@@ -1,5 +1,6 @@
 'use strict';
 
+const { authHeader } = require('./helpers/auth');
 const request = require('supertest');
 const app = require('../src/app');
 const store = require('../src/data/store');
@@ -19,7 +20,7 @@ describe('idempotency', () => {
       const key = 'test-key-12345';
 
       const first = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', key)
         .send(payload);
 
@@ -28,7 +29,7 @@ describe('idempotency', () => {
       expect(first.headers['idempotent-replayed']).toBeUndefined();
 
       const second = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', key)
         .send(payload);
 
@@ -47,14 +48,14 @@ describe('idempotency', () => {
       const key = 'test-key-67890';
 
       const first = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
 
       expect(first.status).toBe(201);
 
       const second = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ sme: 'Test SME', debtor: 'Buyer', amount: 600, dueDate: '2027-01-01' });
 
@@ -64,7 +65,7 @@ describe('idempotency', () => {
 
     test('rejects invalid key format', async () => {
       const res = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', 'invalid key!')
         .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
 
@@ -74,7 +75,7 @@ describe('idempotency', () => {
 
     test('rejects key shorter than 8 chars', async () => {
       const res = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', 'short')
         .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
 
@@ -85,7 +86,7 @@ describe('idempotency', () => {
     test('rejects key longer than 128 chars', async () => {
       const longKey = 'a'.repeat(129);
       const res = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', longKey)
         .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
 
@@ -95,7 +96,7 @@ describe('idempotency', () => {
 
     test('works without key when not required', async () => {
       const res = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
 
       expect(res.status).toBe(201);
@@ -109,7 +110,7 @@ describe('idempotency', () => {
       const initialFunded = invoice.fundedAmount;
 
       const first = await request(app)
-        .post('/api/invoices/INV_0002/fund')
+        .post('/api/invoices/INV_0002/fund').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ amount: 100, investor: INVESTOR });
 
@@ -118,7 +119,7 @@ describe('idempotency', () => {
       expect(first.headers['idempotent-replayed']).toBeUndefined();
 
       const second = await request(app)
-        .post('/api/invoices/INV_0002/fund')
+        .post('/api/invoices/INV_0002/fund').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ amount: 100, investor: INVESTOR });
 
@@ -138,13 +139,13 @@ describe('idempotency', () => {
 
       // First request
       await request(app)
-        .post('/api/invoices/INV_0002/fund')
+        .post('/api/invoices/INV_0002/fund').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ amount: 100, investor: INVESTOR });
 
       // Second request with same key (should replay)
       await request(app)
-        .post('/api/invoices/INV_0002/fund')
+        .post('/api/invoices/INV_0002/fund').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ amount: 100, investor: INVESTOR });
 
@@ -157,14 +158,14 @@ describe('idempotency', () => {
       const key = 'fund-key-67890';
 
       const first = await request(app)
-        .post('/api/invoices/INV_0002/fund')
+        .post('/api/invoices/INV_0002/fund').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ amount: 100, investor: INVESTOR });
 
       expect(first.status).toBe(200);
 
       const second = await request(app)
-        .post('/api/invoices/INV_0002/fund')
+        .post('/api/invoices/INV_0002/fund').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ amount: 200, investor: INVESTOR });
 
@@ -177,7 +178,7 @@ describe('idempotency', () => {
 
       // Use key on invoice creation
       const invoiceRes = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
 
@@ -185,7 +186,7 @@ describe('idempotency', () => {
 
       // Use same key on fund endpoint (should work, different route)
       const fundRes = await request(app)
-        .post('/api/invoices/INV_0002/fund')
+        .post('/api/invoices/INV_0002/fund').set(authHeader())
         .set('Idempotency-Key', key)
         .send({ amount: 100, investor: INVESTOR });
 
@@ -202,7 +203,7 @@ describe('idempotency', () => {
     test('rejects a missing key when IDEMPOTENCY_REQUIRED=true', async () => {
       process.env.IDEMPOTENCY_REQUIRED = 'true';
       const res = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
       expect(res.status).toBe(400);
       expect(res.body.error).toBe('IDEMPOTENCY_KEY_REQUIRED');
@@ -212,7 +213,7 @@ describe('idempotency', () => {
     test('rejects malformed keys', async () => {
       for (const key of ['short', 'x'.repeat(129), 'has spaces in it']) {
         const res = await request(app)
-          .post('/api/invoices')
+          .post('/api/invoices').set(authHeader())
           .set('Idempotency-Key', key)
           .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
         expect(res.status).toBe(400);
@@ -222,9 +223,9 @@ describe('idempotency', () => {
 
     test('payload key order does not change the fingerprint', async () => {
       const key = 'order-insensitive-key';
-      const first = await request(app).post('/api/invoices').set('Idempotency-Key', key)
+      const first = await request(app).post('/api/invoices').set(authHeader()).set('Idempotency-Key', key)
         .send({ sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' });
-      const second = await request(app).post('/api/invoices').set('Idempotency-Key', key)
+      const second = await request(app).post('/api/invoices').set(authHeader()).set('Idempotency-Key', key)
         .send({ dueDate: '2027-01-01', amount: 500, debtor: 'Buyer', sme: 'Test SME' });
       expect(first.status).toBe(201);
       expect(second.status).toBe(201);
@@ -241,7 +242,7 @@ describe('idempotency', () => {
       const payload = { sme: 'Test SME', debtor: 'Buyer', amount: 500, dueDate: '2027-01-01' };
 
       const first = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', key)
         .send(payload);
 
@@ -249,7 +250,7 @@ describe('idempotency', () => {
 
       // The entry should be cached and replayable immediately
       const second = await request(app)
-        .post('/api/invoices')
+        .post('/api/invoices').set(authHeader())
         .set('Idempotency-Key', key)
         .send(payload);
 

@@ -51,4 +51,7 @@ function requireAdminToken(req, res, next) {
   next();
 }
 
+// Marker for the route-table guard test: this guard admits only the admin secret.
+requireAdminToken.requiredRoles = ['admin'];
+
 module.exports = { requireAdminToken, hasValidAdminToken };

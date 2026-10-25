@@ -199,6 +199,7 @@ const Invoice = registry.register(
       onChain: z.boolean().openapi({ description: 'Derived from escrowContractId !== null', readOnly: true }),
       createdAt: z.string().openapi({ format: 'date-time' }),
       duplicateOverride: z.boolean().optional(),
+      createdBy: z.string().optional().openapi({ description: 'Opaque id of the API key that created the invoice' }),
     })
     .openapi('Invoice'),
 );

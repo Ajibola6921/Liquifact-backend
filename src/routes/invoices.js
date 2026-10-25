@@ -14,6 +14,7 @@ const { CreateInvoiceBody, FundInvoiceBodyShape, InvoiceIdParam } = require('../
 const { validate } = require('../middleware/validate');
 const emitter = require('../webhooks/emitter');
 const idempotency = require('../middleware/idempotency');
+const { requireRole } = require('../middleware/auth');
 const smes = require('../data/smes');
 
 const router = express.Router();
@@ -189,8 +190,9 @@ function applySmeIdentity(value) {
   return null;
 }
 
-router.post('/', idempotency, validate({ body: CreateInvoiceBody, audit: 'invoice.create' }), (req, res) => {
-  const value = toInvoiceValue(req.validatedBody);
+router.post('/', requireRole('sme', 'admin'), idempotency, validate({ body: CreateInvoiceBody, audit: 'invoice.create' }), (req, res) => {
+  // Record the opaque API key id that created the invoice (safe to return publicly).
+  const value = { ...toInvoiceValue(req.validatedBody), createdBy: req.principal.keyId };
   const smeRejection = applySmeIdentity(value);
   if (smeRejection) {
     req.audit({
@@ -230,7 +232,7 @@ router.post('/', idempotency, validate({ body: CreateInvoiceBody, audit: 'invoic
   return res.status(201).json({ data: present(invoice) });
 });
 
-router.post('/:id/fund', idempotency, validate({ params: InvoiceIdParam, body: FundInvoiceBodyShape, audit: 'invoice.fund' }), (req, res) => {
+router.post('/:id/fund', requireRole('investor', 'admin'), idempotency, validate({ params: InvoiceIdParam, body: FundInvoiceBodyShape, audit: 'invoice.fund' }), (req, res) => {
   const record = (details) =>
     req.audit({ action: 'invoice.fund', resourceType: 'invoice', resourceId: req.params.id, ...details });
   const reject = (statusCode, error, details, extra = {}) => {
@@ -377,7 +379,7 @@ function transitionAudit(req, res, action) {
   };
 }
 
-router.post('/:id/settle', idParam('invoice.settle'), (req, res) => {
+router.post('/:id/settle', requireRole('admin'), idParam('invoice.settle'), (req, res) => {
   const audit = transitionAudit(req, res, 'invoice.settle');
   const invoice = store.get(req.params.id);
   if (!invoice) {
@@ -390,7 +392,7 @@ router.post('/:id/settle', idParam('invoice.settle'), (req, res) => {
   return audit.success(before, store.settle(invoice));
 });
 
-router.post('/:id/cancel', idParam('invoice.cancel'), (req, res) => {
+router.post('/:id/cancel', requireRole('sme', 'admin'), idParam('invoice.cancel'), (req, res) => {
   const audit = transitionAudit(req, res, 'invoice.cancel');
   const invoice = store.get(req.params.id);
   if (!invoice) {

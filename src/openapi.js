@@ -358,6 +358,54 @@ const IdempotencyErrors = {
   422: { description: 'IDEMPOTENCY_KEY_REUSED: the key was used with a different payload', ...json(ErrorBody) },
 };
 
+const authErrorBody = (codes) => ({
+  type: 'object',
+  required: ['error', 'code'],
+  properties: { error: { type: 'string' }, code: { type: 'string', enum: codes } },
+});
+
+/** Mutating operations guarded by `requireRole` (src/middleware/auth.js) and the roles they accept. */
+const API_KEY_OPERATIONS = [
+  ['/api/invoices', 'post', ['sme', 'admin']],
+  ['/api/invoices/{id}/fund', 'post', ['investor', 'admin']],
+  ['/api/invoices/{id}/settle', 'post', ['admin']],
+  ['/api/invoices/{id}/cancel', 'post', ['sme', 'admin']],
+  ['/api/invoices/{id}/document', 'post', ['sme', 'admin']],
+  ['/api/escrow/attestations/verify', 'post', ['sme', 'investor', 'admin']],
+  ['/api/smes', 'post', ['sme', 'admin']],
+];
+
+/**
+ * Applies the ApiKeyAuth scheme and its 401/403/503 responses to every
+ * API-key-guarded operation.
+ *
+ * @param {object} spec OpenAPI document
+ * @returns {object} the same document
+ */
+function applyApiKeySecurity(spec) {
+  for (const [path, method, roles] of API_KEY_OPERATIONS) {
+    const operation = spec.paths[path] && spec.paths[path][method];
+    if (!operation) {
+      continue;
+    }
+    operation.security = [{ ApiKeyAuth: [] }];
+    operation.description = `${operation.description ? `${operation.description} ` : ''}Requires an API key with role: ${roles.join(' or ')}.`;
+    // Keep any route-specific 403 (e.g. SME_NOT_VERIFIED) alongside FORBIDDEN.
+    const existing403 = operation.responses[403];
+    const extraCode = existing403 && /^[A-Z_]+/.exec(existing403.description);
+    operation.responses = {
+      ...operation.responses,
+      401: { description: 'Missing, malformed or unknown API key', ...json(authErrorBody(['UNAUTHENTICATED'])) },
+      403: {
+        description: `API key role not allowed (needs ${roles.join(' or ')})${existing403 ? `; or ${existing403.description}` : ''}`,
+        ...json(authErrorBody(extraCode ? ['FORBIDDEN', extraCode[0]] : ['FORBIDDEN'])),
+      },
+      503: { description: 'API_KEYS not configured in production (fail closed)', ...json(authErrorBody(['AUTH_NOT_CONFIGURED'])) },
+    };
+  }
+  return spec;
+}
+
 // Built documents are memoised per base URL (bounded, since the base URL can come from the Host header).
 const SPEC_CACHE_LIMIT = 16;
 const specCache = new Map();
@@ -387,7 +435,7 @@ function buildSpec(baseUrl) {
  * @returns {object} OpenAPI 3.0 document
  */
 function createSpec(baseUrl) {
-  return {
+  return applyApiKeySecurity({
     openapi: '3.0.3',
     info: {
       title: 'LiquiFact API',
@@ -409,6 +457,13 @@ function createSpec(baseUrl) {
     ],
     components: {
       securitySchemes: {
+        ApiKeyAuth: {
+          type: 'http',
+          scheme: 'bearer',
+          description:
+            'API key (`Authorization: Bearer <key>` or `X-API-Key: <key>`) configured in API_KEYS with a role: ' +
+            'sme, investor or admin. Required on mutating invoice/SME/attestation routes; GET routes are public.',
+        },
         adminBearer: {
           type: 'http',
           scheme: 'bearer',
@@ -1274,7 +1329,7 @@ function createSpec(baseUrl) {
         },
       },
     },
-  };
+  });
 }
 
 module.exports = { buildSpec };

@@ -115,7 +115,7 @@ function isValidKey(key) {
  * @returns {string} scoped key
  */
 function scopeKey(req, key) {
-  const principal = req.user?.id || req.ip;
+  const principal = req.principal?.keyId || req.ip;
   return `${req.method}:${req.baseUrl}${req.path}:${principal}:${key}`;
 }
 
