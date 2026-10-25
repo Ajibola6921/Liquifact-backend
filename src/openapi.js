@@ -383,6 +383,7 @@ function createSpec(baseUrl) {
       { name: 'Reconciliation' },
       { name: 'Audit' },
       { name: 'Webhooks' },
+      { name: 'SMEs' },
     ],
     components: {
       securitySchemes: {
@@ -498,6 +499,8 @@ function createSpec(baseUrl) {
           responses: {
             201: { description: 'Created', ...json({ type: 'object', properties: { data: Invoice } }) },
             400: { description: 'Validation failed (VALIDATION_FAILED, unknown keys rejected)', ...json(ref('ErrorResponse')) },
+            403: { description: 'SME_NOT_VERIFIED (REQUIRE_SME_VERIFICATION=true and the SME is not verified)', ...json(ref('ErrorResponse')) },
+            404: { description: 'SME_NOT_FOUND (unknown smeId)', ...json(ref('ErrorResponse')) },
             409: { description: 'Duplicate invoice or possible duplicate receivable', ...json(DuplicateError) },
             415: { description: 'Content-Type must be application/json (UNSUPPORTED_MEDIA_TYPE)', ...json(ref('ErrorResponse')) },
           },
@@ -1106,6 +1109,50 @@ function createSpec(baseUrl) {
                 properties: { error: { type: 'string', example: 'NOT_ON_CHAIN' }, detail: { type: 'string' } },
               }),
             },
+          },
+        },
+      },
+      '/api/smes': {
+        post: {
+          tags: ['SMEs'],
+          summary: 'Register an SME for KYB review',
+          description: 'Creates the SME with status `pending`. contactEmail and registrationNumber are PII and are only returned to admins.',
+          requestBody: { required: true, ...json(ref('CreateSmeRequest')) },
+          responses: {
+            201: { description: 'SME created (pending review)', ...json({ type: 'object', properties: { data: ref('SmeRecord') } }) },
+            400: { description: 'Invalid SME fields (VALIDATION_FAILED)', ...json(ref('ErrorResponse')) },
+            409: { description: 'SME_DUPLICATE: same country + registration number, or same Stellar address', ...json(ref('ErrorResponse')) },
+            415: { description: 'Content-Type must be application/json', ...json(ref('ErrorResponse')) },
+          },
+        },
+      },
+      '/api/smes/{id}': {
+        get: {
+          tags: ['SMEs'],
+          summary: 'Get an SME',
+          description: 'contactEmail and registrationNumber are omitted unless a valid admin token is presented.',
+          security: [{ adminBearer: [] }, {}],
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            200: { description: 'SME record (PII omitted for non-admin callers)', ...json({ type: 'object', properties: { data: ref('SmeRecord') } }) },
+            404: { description: 'SME_NOT_FOUND', ...json(ref('ErrorResponse')) },
+          },
+        },
+      },
+      '/api/smes/{id}/review': {
+        post: {
+          tags: ['SMEs'],
+          summary: 'Review an SME (admin)',
+          description: 'Allowed transitions: pending → verified | rejected, verified → suspended. Each decision is appended to reviewHistory.',
+          security: adminSecurity,
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          requestBody: { required: true, ...json(ref('ReviewSmeRequest')) },
+          responses: {
+            200: { description: 'Review recorded', ...json({ type: 'object', properties: { data: ref('SmeRecord') } }) },
+            400: { description: 'Invalid review request (VALIDATION_FAILED)', ...json(ref('ErrorResponse')) },
+            404: { description: 'SME_NOT_FOUND', ...json(ref('ErrorResponse')) },
+            409: { description: 'INVALID_TRANSITION', ...json(ref('ErrorResponse')) },
+            ...adminErrors,
           },
         },
       },

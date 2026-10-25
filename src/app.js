@@ -66,6 +66,9 @@ const ENDPOINTS = [
   { method: 'POST', path: '/api/internal/indexer/run', description: 'Manually trigger escrow event indexer (internal, Bearer CRON_SECRET)' },
   { method: 'GET', path: '/api/reconciliation', description: 'Reconcile all on-chain invoices against escrow state' },
   { method: 'GET', path: '/api/reconciliation/:id', description: 'Reconcile one invoice against escrow state' },
+  { method: 'POST', path: '/api/smes', description: 'Register an SME for KYB review' },
+  { method: 'GET', path: '/api/smes/:id', description: 'Get an SME (PII for admins only)' },
+  { method: 'POST', path: '/api/smes/:id/review', description: 'Review an SME: verify | reject | suspend (admin)' },
   { method: 'POST', path: '/api/webhooks', description: 'Register a webhook subscription (admin)' },
   { method: 'GET', path: '/api/webhooks', description: 'List webhook subscriptions (admin)' },
   { method: 'DELETE', path: '/api/webhooks/:id', description: 'Remove a webhook subscription (admin)' },
@@ -126,6 +129,7 @@ app.use('/api/invoices/:id/document', require('./routes/invoiceDocument'));
 app.use('/api/escrow', require('./routes/escrow'));
 app.use('/api/reconciliation', require('./routes/reconciliation'));
 app.use('/api/webhooks', require('./routes/webhooks'));
+app.use('/api/smes', require('./routes/smes'));
 
 // Start webhook delivery listener (idempotent — safe to call multiple times)
 require('./webhooks/deliver').startListening();

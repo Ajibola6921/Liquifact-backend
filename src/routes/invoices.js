@@ -13,6 +13,7 @@ const escrowReader = require('./escrow');
 const { CreateInvoiceBody, FundInvoiceBodyShape, InvoiceIdParam } = require('../schemas');
 const { validate } = require('../middleware/validate');
 const emitter = require('../webhooks/emitter');
+const smes = require('../data/smes');
 
 const router = express.Router();
 router.use(auditContext());
@@ -40,7 +41,8 @@ function present(invoice) {
 function toInvoiceValue(d) {
   const invoiceNumber = typeof d.invoiceNumber === 'string' ? d.invoiceNumber.trim() : undefined;
   return {
-    sme: d.sme.trim(),
+    ...(typeof d.sme === 'string' ? { sme: d.sme.trim() } : {}),
+    ...(d.smeId ? { smeId: d.smeId } : {}),
     debtor: d.debtor.trim(),
     ...(invoiceNumber ? { invoiceNumber } : {}),
     smeAddress: typeof d.smeAddress === 'string' ? d.smeAddress : null,
@@ -145,8 +147,60 @@ router.get('/:id/quote', idParam(), (req, res) => {
   });
 });
 
+/**
+ * Resolves the SME identity of a new invoice.
+ *
+ * With REQUIRE_SME_VERIFICATION=true an smeId is required, the SME must be
+ * verified, and `sme`/`smeAddress` always come from the SME record (client
+ * values are ignored, so an invoice cannot impersonate another SME). Without
+ * the flag, an smeId is optional; when given, it must exist and fills in any
+ * identity fields the client left out.
+ *
+ * @param {object} value validated invoice fields (mutated)
+ * @returns {{ status: number, error: string, code: string }|null} rejection, or null when accepted
+ */
+function applySmeIdentity(value) {
+  const enforce = process.env.REQUIRE_SME_VERIFICATION === 'true';
+  if (enforce && !value.smeId) {
+    return { status: 400, error: 'smeId is required when SME verification is enabled', code: 'SME_ID_REQUIRED' };
+  }
+  if (!value.smeId) {
+    return null;
+  }
+  const sme = smes.getSme(value.smeId);
+  if (!sme) {
+    return { status: 404, error: 'SME not found', code: 'SME_NOT_FOUND' };
+  }
+  if (enforce) {
+    if (sme.status !== 'verified') {
+      return { status: 403, error: 'Only verified SMEs may create invoices', code: 'SME_NOT_VERIFIED' };
+    }
+    value.sme = sme.legalName;
+    value.smeAddress = sme.stellarAddress;
+    return null;
+  }
+  if (value.sme === undefined) {
+    value.sme = sme.legalName;
+  }
+  if (value.smeAddress === null) {
+    value.smeAddress = sme.stellarAddress;
+  }
+  return null;
+}
+
 router.post('/', validate({ body: CreateInvoiceBody, audit: 'invoice.create' }), (req, res) => {
   const value = toInvoiceValue(req.validatedBody);
+  const smeRejection = applySmeIdentity(value);
+  if (smeRejection) {
+    req.audit({
+      action: 'invoice.create',
+      resourceType: 'invoice',
+      outcome: 'rejected',
+      statusCode: smeRejection.status,
+      metadata: { code: smeRejection.code, smeId: value.smeId || null },
+    });
+    return res.status(smeRejection.status).json({ error: smeRejection.error, code: smeRejection.code });
+  }
   let invoice;
   try {
     invoice = store.create(value);
