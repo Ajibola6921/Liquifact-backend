@@ -143,6 +143,25 @@ function parseApiKeys(raw, errors) {
 }
 
 /**
+ * Reads an integer environment value.
+ *
+ * @param {string|undefined} raw raw environment value
+ * @param {number} fallback value used when the variable is unset or invalid
+ * @param {number} [min] smallest accepted value
+ * @returns {number} the configured value
+ */
+function envInt(raw, fallback, min = 0) {
+  if (raw === undefined || raw === '') {
+    return fallback;
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < min) {
+    return fallback;
+  }
+  return value;
+}
+
+/**
  * @param {string|undefined} raw environment value
  * @param {number} fallback value used when raw is missing or not a positive integer
  * @returns {number} parsed positive integer
@@ -314,6 +333,11 @@ function loadConfig(env = process.env) {
     txWaitMs,
     protocolFeeBps,
     auditMaxEntries: positiveInt(env.AUDIT_MAX_ENTRIES, 10000),
+    // Readiness probe: per-check timeout, maximum accepted ledger age and how
+    // long a probe result may be reused before the RPC is called again.
+    readyCheckTimeoutMs: envInt(env.READY_CHECK_TIMEOUT_MS, 2000, 1),
+    readyMaxLedgerAgeSeconds: envInt(env.READY_MAX_LEDGER_AGE_SECONDS, 60, 1),
+    readyCacheSeconds: envInt(env.READY_CACHE_SECONDS, 10, 0),
     nodeEnv: env.NODE_ENV || 'development',
     ROLES,
     apiKeys,
