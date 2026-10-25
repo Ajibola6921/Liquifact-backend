@@ -9,6 +9,28 @@ const { z } = require('zod');
 const { extendZodWithOpenApi, OpenAPIRegistry } = require('@asteasolutions/zod-to-openapi');
 const { StrKey } = require('@stellar/stellar-sdk');
 const { STATUSES, normalizeIdentity } = require('../data/store');
+const { parseAmount } = require('../lib/money');
+
+// Money on the API boundary: a decimal string (preferred) or a JSON number,
+// at most 7 fractional digits, > 0 and <= MAX_INVOICE_AMOUNT (2^63-1 minor units).
+const DECIMAL_AMOUNT = /^\d+(\.\d{1,7})?$/;
+// Approximate upper bound for docs; the exact limit is enforced by parseAmount.
+const MAX_AMOUNT_NUMBER = Number('922337203685.4775807');
+const isParseableAmount = (value) => {
+  try {
+    parseAmount(value);
+    return true;
+  } catch {
+    return false;
+  }
+};
+const moneyInput = (message) => z
+  .union([
+    z.number().gt(0).max(MAX_AMOUNT_NUMBER),
+    z.string().regex(DECIMAL_AMOUNT),
+  ], { errorMap: () => ({ message }) })
+  .refine(isParseableAmount, message);
+const decimalString = () => z.string().regex(DECIMAL_AMOUNT);
 
 extendZodWithOpenApi(z);
 
@@ -102,11 +124,8 @@ const CreateInvoiceBody = registry.register(
         .boolean()
         .optional()
         .openapi({ description: 'Explicitly permits a possible duplicate; never bypasses an exact invoice-number duplicate.' }),
-      amount: z
-        .number({ required_error: AMOUNT_MESSAGE, invalid_type_error: AMOUNT_MESSAGE })
-        .gt(0, AMOUNT_MESSAGE)
-        .max(1e12, AMOUNT_MESSAGE)
-        .openapi({ description: 'Invoice face value', example: 25000 }),
+      amount: moneyInput(AMOUNT_MESSAGE)
+        .openapi({ description: 'Invoice face value: decimal string (preferred) or number, max 7 fractional digits', example: '25000.50' }),
       currency: z
         .string()
         .optional()
@@ -148,10 +167,8 @@ const FundInvoiceBody = registry.register(
   'FundInvoiceBody',
   z
     .object({
-      amount: z
-        .number()
-        .gt(0)
-        .openapi({ description: 'Positive finite amount not exceeding the invoice face value', example: 7000 }),
+      amount: moneyInput('amount must be a positive amount with at most 7 fractional digits')
+        .openapi({ description: 'Positive amount (decimal string or number, max 7 fractional digits) not exceeding the invoice face value', example: '7000' }),
       investor: z
         .string()
         .openapi({ description: 'Stellar public key of the investor', example: 'GA7TXEBMEPQCLHIYCWDN7RKAO5IMRD2UV7O7TZXMEW6VZUMEXNR4XBB5' }),
@@ -188,10 +205,11 @@ const Invoice = registry.register(
       sme: z.string().openapi({ example: 'Acme Components Ltd' }),
       smeAddress: z.string().nullable(),
       debtor: z.string().openapi({ example: 'Globex Retail' }),
-      amount: z.number().openapi({ example: 25000 }),
+      amount: decimalString().openapi({ example: '25000', description: 'Face value as a decimal string (see decimals)' }),
       currency: z.string().openapi({ example: 'USDC' }),
-      fundedAmount: z.number().openapi({ example: 0 }),
-      remainingCapacity: z.number().openapi({ example: 25000, description: 'amount - fundedAmount (computed)' }),
+      fundedAmount: z.string().regex(/^\d+(\.\d{1,7})?$/).openapi({ example: '0', description: 'Funded amount as a decimal string' }),
+      remainingCapacity: z.string().regex(/^\d+(\.\d{1,7})?$/).openapi({ example: '25000', description: 'amount - fundedAmount (computed, decimal string)' }),
+      decimals: z.number().int().openapi({ example: 7, description: 'Fractional digits of the amount strings (minor units)' }),
       yieldBps: z.number().int().openapi({ example: 800 }),
       dueDate: z.string().openapi({ format: 'date', example: '2027-01-17' }),
       status: z.enum(STATUSES),

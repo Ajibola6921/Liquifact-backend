@@ -19,7 +19,7 @@ const { sendProblem } = require('../errors');
  * @param {{ body?: import('zod').ZodTypeAny, params?: import('zod').ZodTypeAny, query?: import('zod').ZodTypeAny, audit?: string }} schemas
  * @returns {import('express').RequestHandler} middleware
  */
-function validate({ body: bodySchema, params: paramsSchema, query: querySchema, audit } = {}) {
+function validate({ body: bodySchema, params: paramsSchema, query: querySchema, audit, fieldCodes = {} } = {}) {
   return function validationMiddleware(req, res, next) {
     const reject = (statusCode, payload) => {
       if (audit && typeof req.audit === 'function') {
@@ -85,9 +85,11 @@ function validate({ body: bodySchema, params: paramsSchema, query: querySchema, 
     if (allErrors.length) {
       // details: legacy flat string array for backward compatibility
       const details = [...new Set(allErrors.map((e) => e.message))];
+      // A more specific code when every failing field maps to the same one (e.g. amount -> INVALID_AMOUNT).
+      const specific = [...new Set(allErrors.map((e) => fieldCodes[e.path]))];
       return reject(400, {
         error: 'Validation failed',
-        code: 'VALIDATION_FAILED',
+        code: specific.length === 1 && specific[0] ? specific[0] : 'VALIDATION_FAILED',
         details,
         errors: allErrors,
       });

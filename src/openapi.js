@@ -21,7 +21,7 @@ const FundingError = {
   properties: {
     error: { type: 'string' },
     code: { type: 'string', enum: ['FUNDING_EXCEEDS_CAPACITY', 'INVALID_AMOUNT'] },
-    remainingCapacity: { type: 'number', description: 'Remaining capacity at the time of rejection' },
+    remainingCapacity: { type: 'string', pattern: '^\\d+(\\.\\d{1,7})?$', description: 'Remaining capacity at the time of rejection (decimal string)' },
   },
 };
 
@@ -32,8 +32,8 @@ const FundResponse = {
   type: 'object',
   properties: {
     data: Invoice,
-    accepted: { type: 'number', description: 'Present only when allowPartial is true and the amount was capped' },
-    rejected: { type: 'number', description: 'Present only when allowPartial is true and the amount was capped' },
+    accepted: { type: 'string', description: 'Decimal string; present only when allowPartial is true and the amount was capped' },
+    rejected: { type: 'string', description: 'Decimal string; present only when allowPartial is true and the amount was capped' },
   },
 };
 
@@ -735,16 +735,16 @@ function createSpec(baseUrl) {
                     },
                   },
                   generatedAt: { type: 'string', format: 'date-time' },
-                  totalFaceValue: { type: 'number', deprecated: true, description: 'Compatibility alias of deprecated.totalFaceValue for one release only' },
-                  totalFunded: { type: 'number', deprecated: true, description: 'Compatibility alias of deprecated.totalFunded for one release only' },
+                  totalFaceValue: { type: 'string', deprecated: true, description: 'Compatibility alias of deprecated.totalFaceValue for one release only (decimal string)' },
+                  totalFunded: { type: 'string', deprecated: true, description: 'Compatibility alias of deprecated.totalFunded for one release only (decimal string)' },
                   averageYieldBps: { type: 'number', deprecated: true, description: 'Compatibility alias of deprecated.averageYieldBps for one release only' },
                   deprecated: {
                     type: 'object', deprecated: true,
                     description: 'Legacy mixed-currency calculations retained here for one release only. Not meaningful financial totals.',
                     required: ['totalFaceValue', 'totalFunded', 'averageYieldBps'],
                     properties: {
-                      totalFaceValue: { type: 'number', deprecated: true },
-                      totalFunded: { type: 'number', deprecated: true },
+                      totalFaceValue: { type: 'string', deprecated: true },
+                      totalFunded: { type: 'string', deprecated: true },
                       averageYieldBps: { type: 'number', deprecated: true },
                     },
                   },

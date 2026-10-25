@@ -20,6 +20,7 @@ const { getReadiness } = require('./services/readiness');
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', true);
+app.set('json replacer', (_key, value) => (typeof value === 'bigint' ? value.toString() : value));
 
 app.use(
   helmet({

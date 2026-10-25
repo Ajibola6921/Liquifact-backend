@@ -129,7 +129,7 @@ describe('idempotency', () => {
 
       // Verify fundedAmount increased only once
       const updated = store.get('INV_0002');
-      expect(updated.fundedAmount).toBe(initialFunded + 100);
+      expect(Number(updated.fundedAmount)).toBe(Number(initialFunded) + 100);
     });
 
     test('same fund request twice with one key increases fundedAmount once', async () => {
@@ -151,7 +151,7 @@ describe('idempotency', () => {
 
       // Verify fundedAmount increased only once
       const updated = store.get('INV_0002');
-      expect(updated.fundedAmount).toBe(initialFunded + 100);
+      expect(Number(updated.fundedAmount)).toBe(Number(initialFunded) + 100);
     });
 
     test('rejects different payload with same key', async () => {

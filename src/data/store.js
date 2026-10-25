@@ -9,6 +9,7 @@
 
 const assert = require('node:assert');
 const contributions = require('./contributions');
+const { formatAmount, toMinorUnits } = require('../lib/money');
 const config = require('../config');
 
 const STATUSES = ['open', 'funded', 'settled', 'cancelled'];
@@ -75,7 +76,7 @@ const seed = () => {
   ];
   for (const inv of records) {
     assert.strictEqual(
-      inv.fundedAmount,
+      toMinorUnits(inv.fundedAmount),
       contributions.sumForInvoice(inv.id),
       `Invoice ${inv.id} fundedAmount must equal contributions sum`,
     );
@@ -117,7 +118,8 @@ function exactKey(invoice) {
  * @returns {string} key identifying the same receivable (SME, debtor, amount, due date)
  */
 function fuzzyKey(invoice) {
-  return compositeKey([normalizeIdentity(invoice.sme), normalizeIdentity(invoice.debtor), invoice.amount, invoice.dueDate]);
+  const amount = invoice.amountMinor !== undefined ? formatAmount(toMinorUnits(invoice.amountMinor)) : String(invoice.amount);
+  return compositeKey([normalizeIdentity(invoice.sme), normalizeIdentity(invoice.debtor), amount, invoice.dueDate]);
 }
 
 /**
@@ -181,6 +183,41 @@ function withDerivedOnChain(invoice) {
     },
   });
   return invoice;
+}
+
+/**
+ * Stores money as bigint minor units (non-enumerable `amountMinor`,
+ * `fundedAmountMinor`) and exposes `amount`/`fundedAmount` as canonical decimal
+ * strings, so JSON serialisation (responses, audit log, webhooks) never sees a
+ * bigint or a float. Accepts legacy numeric/decimal `amount` input.
+ *
+ * @param {object} record invoice record (mutated)
+ * @returns {object} the same record
+ */
+function withMoney(record) {
+  const amountMinor = record.amountMinor !== undefined ? toMinorUnits(record.amountMinor) : toMinorUnits(record.amount);
+  const fundedAmountMinor = record.fundedAmountMinor !== undefined
+    ? toMinorUnits(record.fundedAmountMinor)
+    : toMinorUnits(record.fundedAmount || 0);
+  delete record.amount;
+  delete record.fundedAmount;
+  Object.defineProperty(record, 'amountMinor', { value: amountMinor, writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(record, 'fundedAmountMinor', { value: fundedAmountMinor, writable: true, enumerable: false, configurable: true });
+  Object.defineProperty(record, 'amount', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      return formatAmount(this.amountMinor);
+    },
+  });
+  Object.defineProperty(record, 'fundedAmount', {
+    enumerable: true,
+    configurable: true,
+    get() {
+      return formatAmount(this.fundedAmountMinor);
+    },
+  });
+  return record;
 }
 
 let invoices = [];
@@ -296,7 +333,7 @@ function create(invoice) {
   }
   const record = {
     id,
-    fundedAmount: 0,
+    fundedAmountMinor: 0n,
     status: 'open',
     escrowContractId: null,
     createdAt: new Date().toISOString(),
@@ -304,6 +341,7 @@ function create(invoice) {
     ...invoice,
   };
   delete record.confirmNotDuplicate;
+  withMoney(record);
   withDerivedOnChain(record);
   invoices.push(record);
   indexInvoice(record);
@@ -311,13 +349,31 @@ function create(invoice) {
 }
 
 /**
+ * Amount fields of an invoice in minor units (7 decimals). Store records keep
+ * bigint `amountMinor`/`fundedAmountMinor`; plain objects fall back to their
+ * decimal `amount`/`fundedAmount`.
+ *
+ * @param {object} invoice invoice record
+ * @returns {{ amountMinor: bigint, fundedAmountMinor: bigint }} minor units
+ */
+function minorOf(invoice) {
+  return {
+    amountMinor: invoice.amountMinor !== undefined ? invoice.amountMinor : toMinorUnits(invoice.amount),
+    fundedAmountMinor: invoice.fundedAmountMinor !== undefined
+      ? invoice.fundedAmountMinor
+      : toMinorUnits(invoice.fundedAmount || 0),
+  };
+}
+
+/**
  * Remaining funding capacity for an invoice.
  *
  * @param {object} invoice target invoice
- * @returns {number} amount that can still be contributed
+ * @returns {bigint} minor units that can still be contributed
  */
 function remaining(invoice) {
-  return invoice.amount - invoice.fundedAmount;
+  const { amountMinor, fundedAmountMinor } = minorOf(invoice);
+  return amountMinor - fundedAmountMinor;
 }
 
 /**
@@ -329,17 +385,18 @@ function remaining(invoice) {
  * @returns {object} updated invoice
  */
 function fund(invoice, amount, investor) {
-  if (!(amount <= remaining(invoice))) {
+  const amountMinor = toMinorUnits(amount);
+  if (!(amountMinor <= remaining(invoice))) {
     throw new Error('fund() called with amount exceeding remaining capacity');
   }
   assert(investor, 'investor address is required to fund an invoice');
-  contributions.record({ invoiceId: invoice.id, investor, amount });
-  invoice.fundedAmount = contributions.sumForInvoice(invoice.id);
-  if (invoice.fundedAmount >= invoice.amount) {
+  contributions.record({ invoiceId: invoice.id, investor, amountMinor });
+  invoice.fundedAmountMinor = contributions.sumForInvoice(invoice.id);
+  if (invoice.fundedAmountMinor >= invoice.amountMinor) {
     invoice.status = 'funded';
   }
   assert.strictEqual(
-    invoice.fundedAmount,
+    invoice.fundedAmountMinor,
     contributions.sumForInvoice(invoice.id),
     `Invoice ${invoice.id} fundedAmount must equal contributions sum`,
   );
@@ -371,7 +428,7 @@ function cancel(invoice) {
 /** Restores the seed data (used by tests). */
 function reset() {
   contributions.reset();
-  invoices = seed().map(withDerivedOnChain);
+  invoices = seed().map((record) => withDerivedOnChain(withMoney(record)));
   rebuildIndexes();
 }
 
@@ -411,6 +468,7 @@ module.exports = {
   create,
   fund,
   remaining,
+  minorOf,
   settle,
   cancel,
   linkEscrow,

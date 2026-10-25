@@ -14,6 +14,7 @@ const escrowReader = require('./escrow');
 const { CreateInvoiceBody, FundInvoiceBodyShape, InvoiceIdParam } = require('../schemas');
 const { validate } = require('../middleware/validate');
 const emitter = require('../webhooks/emitter');
+const { parseAmount, formatAmount } = require('../lib/money');
 const idempotency = require('../middleware/idempotency');
 const { requireRole } = require('../middleware/auth');
 const smes = require('../data/smes');
@@ -31,7 +32,8 @@ function present(invoice) {
   if (!invoice) {
     return invoice;
   }
-  return { ...invoice, remainingCapacity: store.remaining(invoice) };
+  // amount/fundedAmount are decimal strings (7 decimals, see lib/money.js).
+  return { ...invoice, remainingCapacity: formatAmount(store.remaining(invoice)), decimals: 7 };
 }
 
 /**
@@ -49,7 +51,7 @@ function toInvoiceValue(d) {
     debtor: d.debtor.trim(),
     ...(invoiceNumber ? { invoiceNumber } : {}),
     smeAddress: typeof d.smeAddress === 'string' ? d.smeAddress : null,
-    amount: d.amount,
+    amountMinor: parseAmount(d.amount),
     currency: typeof d.currency === 'string' ? d.currency.toUpperCase().slice(0, 12) : 'USDC',
     yieldBps: d.yieldBps == null ? 800 : d.yieldBps,
     dueDate: d.dueDate,
@@ -119,7 +121,7 @@ router.get('/:id/quote', idParam(), (req, res) => {
   let capacityMinor;
   try {
     principalMinor = toMinor(amount);
-    capacityMinor = toMinor(invoice.amount) - toMinor(invoice.fundedAmount);
+    capacityMinor = store.remaining(invoice);
   } catch {
     throw badRequest('INVALID_AMOUNT');
   }
@@ -193,7 +195,7 @@ function applySmeIdentity(value) {
   return null;
 }
 
-router.post('/', requireRole('sme', 'admin'), idempotency, validate({ body: CreateInvoiceBody, audit: 'invoice.create' }), (req, res) => {
+router.post('/', requireRole('sme', 'admin'), idempotency, validate({ body: CreateInvoiceBody, audit: 'invoice.create', fieldCodes: { amount: 'INVALID_AMOUNT' } }), (req, res) => {
   // Record the opaque API key id that created the invoice (safe to return publicly).
   const value = { ...toInvoiceValue(req.validatedBody), createdBy: req.principal.keyId };
   const smeRejection = applySmeIdentity(value);
@@ -258,7 +260,7 @@ router.post('/:id/fund', requireRole('investor', 'admin'), idempotency, validate
   const { amount, investor } = body;
   const before = { fundedAmount: invoice.fundedAmount, status: invoice.status };
   const requested = {
-    requestedAmount: typeof amount === 'number' && Number.isFinite(amount) ? amount : null,
+    requestedAmount: (typeof amount === 'number' && Number.isFinite(amount)) || typeof amount === 'string' ? amount : null,
     requestedAmountType: typeof amount,
   };
   if (investor === undefined || investor === null || investor === '') {
@@ -270,10 +272,14 @@ router.post('/:id/fund', requireRole('investor', 'admin'), idempotency, validate
   if (invoice.smeAddress && investor === invoice.smeAddress) {
     return reject(422, 'SELF_FUNDING_NOT_ALLOWED', { before, metadata: requested });
   }
-  if (typeof amount !== 'number' || !Number.isFinite(amount) || !(amount > 0)) {
-    return reject(400, 'amount must be a positive finite number', { before, metadata: requested }, { code: 'INVALID_AMOUNT' });
+  // Money is parsed into bigint minor units (7 decimals); floats never touch the arithmetic.
+  let amountMinor;
+  try {
+    amountMinor = parseAmount(amount);
+  } catch {
+    return reject(400, 'amount must be a positive amount with at most 7 fractional digits', { before, metadata: requested }, { code: 'INVALID_AMOUNT' });
   }
-  if (amount > invoice.amount) {
+  if (amountMinor > invoice.amountMinor) {
     return reject(400, 'amount must not exceed the invoice face value', { before, metadata: requested }, {
       code: 'INVALID_AMOUNT',
     });
@@ -286,19 +292,23 @@ router.post('/:id/fund', requireRole('investor', 'admin'), idempotency, validate
   }
 
   // Contributions are accepted in full or rejected; allowPartial explicitly caps at remaining capacity.
-  const remainingCapacity = store.remaining(invoice);
-  let accepted = amount;
-  if (amount > remainingCapacity) {
+  const remainingMinor = store.remaining(invoice);
+  const remainingCapacity = formatAmount(remainingMinor);
+  let acceptedMinor = amountMinor;
+  if (amountMinor > remainingMinor) {
     if (body.allowPartial !== true) {
       return reject(422, 'Contribution exceeds remaining capacity', {
         before,
         metadata: { ...requested, remainingCapacity },
       }, { code: 'FUNDING_EXCEEDS_CAPACITY', remainingCapacity });
     }
-    accepted = remainingCapacity;
+    acceptedMinor = remainingMinor;
   }
+  const partial = acceptedMinor !== amountMinor;
+  const accepted = formatAmount(acceptedMinor);
+  const rejected = formatAmount(amountMinor - acceptedMinor);
   const wasFunded = invoice.status === 'funded';
-  const updated = store.fund(invoice, accepted, investor);
+  const updated = store.fund(invoice, acceptedMinor, investor);
   // Emit funding_received for every contribution; emit funded when status flips to funded
   emitter.emit('invoice.funding_received', present(updated));
   if (!wasFunded && updated.status === 'funded') {
@@ -309,10 +319,10 @@ router.post('/:id/fund', requireRole('investor', 'admin'), idempotency, validate
     statusCode: 200,
     before,
     after: { fundedAmount: updated.fundedAmount, status: updated.status },
-    metadata: accepted === amount ? requested : { ...requested, accepted, rejected: amount - accepted },
+    metadata: partial ? { ...requested, accepted, rejected } : requested,
   });
-  if (accepted !== amount) {
-    return res.json({ data: present(updated), accepted, rejected: amount - accepted });
+  if (partial) {
+    return res.json({ data: present(updated), accepted, rejected });
   }
   return res.json({ data: present(updated) });
 });
@@ -344,7 +354,7 @@ router.get('/:id/contributions', idParam(), (req, res) => {
   const page = all.slice(startIndex, startIndex + limit);
   const data = page.map((c) => ({
     investor: c.investor,
-    amount: c.amount,
+    amount: formatAmount(c.amountMinor),
     createdAt: c.createdAt,
   }));
 
@@ -359,6 +369,7 @@ router.get('/:id/contributions', idParam(), (req, res) => {
       funded: totalFunded,
       investors: uniqueInvestors,
     },
+    decimals: 7,
   };
   if (nextCursor) {
     response.nextCursor = nextCursor;
@@ -460,7 +471,7 @@ function validateEscrowTerms(invoice, escrow) {
     }
   };
   check('invoice_id', invoice.id, escrow.invoice_id);
-  check('amount', exactStroops(invoice.amount), escrow.amount);
+  check('amount', invoice.amountMinor !== undefined ? invoice.amountMinor.toString() : exactStroops(invoice.amount), escrow.amount);
   if (invoice.smeAddress) {
     check('sme_address', invoice.smeAddress, escrow.sme_address);
   }

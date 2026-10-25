@@ -47,7 +47,7 @@ describe('recording mutations', () => {
     // The authenticated API key id is recorded as the actor (#1534).
     expect(e.actor).toBe('test-admin');
     expect(e.before).toBeNull();
-    expect(e.after.amount).toBe(500);
+    expect(e.after.amount).toBe('500');
     expect(e.after.status).toBe('open');
     expect(typeof e.requestId).toBe('string');
     expect(Number.isNaN(Date.parse(e.at))).toBe(false);
@@ -56,14 +56,14 @@ describe('recording mutations', () => {
   test('invoice.fund records before/after fundedAmount and status', async () => {
     const res = await request(app).post('/api/invoices/INV_0002/fund').set(authHeader()).send({ amount: 1000, investor: INVESTOR });
     expect(res.status).toBe(200);
-    expect(res.body.data.fundedAmount).toBe(19000);
+    expect(res.body.data.fundedAmount).toBe('19000');
     const [e] = entries();
     expect(e.action).toBe('invoice.fund');
     expect(e.resourceId).toBe('INV_0002');
     expect(e.outcome).toBe('success');
     expect(e.statusCode).toBe(200);
-    expect(e.before).toEqual({ fundedAmount: 18000, status: 'open' });
-    expect(e.after).toEqual({ fundedAmount: 19000, status: 'open' });
+    expect(e.before).toEqual({ fundedAmount: '18000', status: 'open' });
+    expect(e.after).toEqual({ fundedAmount: '19000', status: 'open' });
     expect(e.metadata.requestedAmount).toBe(1000);
   });
 
@@ -71,8 +71,8 @@ describe('recording mutations', () => {
     const res = await request(app).post('/api/invoices/INV_0002/fund').set(authHeader()).send({ amount: 7000, investor: INVESTOR });
     expect(res.body.data.status).toBe('funded');
     const [e] = entries();
-    expect(e.before).toEqual({ fundedAmount: 18000, status: 'open' });
-    expect(e.after).toEqual({ fundedAmount: 25000, status: 'funded' });
+    expect(e.before).toEqual({ fundedAmount: '18000', status: 'open' });
+    expect(e.after).toEqual({ fundedAmount: '25000', status: 'funded' });
     expect(e.metadata.requestedAmount).toBe(7000);
   });
 
@@ -83,7 +83,7 @@ describe('recording mutations', () => {
     expect(e.action).toBe('invoice.fund');
     expect(e.outcome).toBe('rejected');
     expect(e.metadata.error).toBe('INVESTOR_REQUIRED');
-    expect(e.before).toEqual({ fundedAmount: 18000, status: 'open' });
+    expect(e.before).toEqual({ fundedAmount: '18000', status: 'open' });
   });
 
   test('settle and cancel transitions are recorded with before/after status', async () => {
@@ -94,8 +94,8 @@ describe('recording mutations', () => {
 
     const [settled, notFunded, cancelled, missing] = entries();
     expect(settled).toEqual(expect.objectContaining({ action: 'invoice.settle', resourceId: 'INV_0003', outcome: 'success', statusCode: 200 }));
-    expect(settled.before).toEqual({ fundedAmount: 42000, status: 'funded' });
-    expect(settled.after).toEqual({ fundedAmount: 42000, status: 'settled' });
+    expect(settled.before).toEqual({ fundedAmount: '42000', status: 'funded' });
+    expect(settled.after).toEqual({ fundedAmount: '42000', status: 'settled' });
     expect(notFunded).toEqual(expect.objectContaining({ action: 'invoice.settle', outcome: 'rejected', statusCode: 409 }));
     expect(cancelled).toEqual(expect.objectContaining({ action: 'invoice.cancel', outcome: 'success' }));
     expect(cancelled.after.status).toBe('cancelled');
@@ -119,14 +119,14 @@ describe('recording mutations', () => {
     expect(notFound.metadata.error).toBe('Invoice not found');
 
     expect(invalid.resourceId).toBe('INV_0001');
-    expect(invalid.before).toEqual({ fundedAmount: 0, status: 'open' });
+    expect(invalid.before).toEqual({ fundedAmount: '0', status: 'open' });
     expect(invalid.after).toBeNull();
     expect(invalid.metadata.requestedAmount).toBe(-5);
 
-    expect(notOpen.before).toEqual({ fundedAmount: 42000, status: 'funded' });
+    expect(notOpen.before).toEqual({ fundedAmount: '42000', status: 'funded' });
     expect(notOpen.metadata.error).toContain('funded');
 
-    expect((await request(app).get('/api/invoices/INV_0001')).body.data.fundedAmount).toBe(0);
+    expect((await request(app).get('/api/invoices/INV_0001')).body.data.fundedAmount).toBe('0');
   });
 
   test('a rejected create is recorded with the validation errors', async () => {

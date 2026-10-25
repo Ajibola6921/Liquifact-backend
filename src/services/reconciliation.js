@@ -1,5 +1,7 @@
 'use strict';
 
+const { toMinorUnits } = require('../lib/money');
+
 /**
  * Maps an off-chain status string to the expected on-chain u32 value(s).
  * Status 3 (withdrawn) is treated as compatible with the off-chain "funded" state.
@@ -21,9 +23,8 @@ const STATUS_MAP = {
  * @returns {bigint} stroops
  */
 function toStroops(amount) {
-  // Multiply by 1e7 using integer arithmetic to avoid float rounding.
-  // Math.round handles any residual floating-point error.
-  return BigInt(Math.round(amount * 1e7));
+  // Exact decimal -> minor-unit conversion (no floating point; see lib/money.js).
+  return toMinorUnits(typeof amount === 'number' ? amount : String(amount));
 }
 
 /**

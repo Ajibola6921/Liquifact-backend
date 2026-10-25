@@ -92,7 +92,7 @@ describe('POST /api/invoices/:id/fund — roles', () => {
       .set(bearer(INVESTOR_KEY))
       .send({ amount: 100, investor: validInvestor });
     expect(res.status).toBe(200);
-    expect(res.body.data.fundedAmount).toBe(18100);
+    expect(res.body.data.fundedAmount).toBe('18100');
   });
 
   test('investor key cannot create invoices (403)', async () => {
