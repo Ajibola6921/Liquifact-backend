@@ -13,9 +13,12 @@ const FIXTURE_PATH = path.join(__dirname, 'fixtures', 'sample.pdf');
 const FIXTURE_BYTES = fs.readFileSync(FIXTURE_PATH);
 const FIXTURE_SHA256 = crypto.createHash('sha256').update(FIXTURE_BYTES).digest('hex');
 
+const idempotency = require('../src/middleware/idempotency');
+
 beforeEach(() => {
   store.reset();
   defaultDocumentStore.clear();
+  idempotency.resetStore();
 });
 
 describe('system', () => {

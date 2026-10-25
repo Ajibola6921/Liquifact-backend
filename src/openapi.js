@@ -336,6 +336,28 @@ const DeliveryRecord = {
   },
 };
 
+const IdempotencyKeyParam = {
+  name: 'Idempotency-Key',
+  in: 'header',
+  required: false,
+  description:
+    'Idempotency key for safe retries (8-128 chars: letters, digits, _ and -). A repeat with the same key and ' +
+    'payload replays the first response; required when IDEMPOTENCY_REQUIRED=true.',
+  schema: { type: 'string', minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' },
+};
+
+const IdempotencyHeaders = {
+  'Idempotency-Key': { description: 'Echo of the request Idempotency-Key', schema: { type: 'string' } },
+  'Idempotent-Replayed': {
+    description: 'Present with value "true" when the response is a replay of a cached request',
+    schema: { type: 'string' },
+  },
+};
+
+const IdempotencyErrors = {
+  422: { description: 'IDEMPOTENCY_KEY_REUSED: the key was used with a different payload', ...json(ErrorBody) },
+};
+
 // Built documents are memoised per base URL (bounded, since the base URL can come from the Host header).
 const SPEC_CACHE_LIMIT = 16;
 const specCache = new Map();
@@ -495,14 +517,23 @@ function createSpec(baseUrl) {
           tags: ['Invoices'],
           summary: 'Submit an invoice for financing',
           description: 'Every attempt, accepted or rejected, is recorded in the audit log as `invoice.create`.',
+          parameters: [IdempotencyKeyParam],
           requestBody: { required: true, ...json(GENERATED_SCHEMAS.CreateInvoiceBody) },
           responses: {
-            201: { description: 'Created', ...json({ type: 'object', properties: { data: Invoice } }) },
-            400: { description: 'Validation failed (VALIDATION_FAILED, unknown keys rejected)', ...json(ref('ErrorResponse')) },
+            201: { description: 'Created', headers: IdempotencyHeaders, ...json({ type: 'object', properties: { data: Invoice } }) },
+            400: {
+              description: 'Validation failed (VALIDATION_FAILED, unknown keys rejected), or missing/invalid Idempotency-Key',
+              ...json(ref('ErrorResponse')),
+            },
             403: { description: 'SME_NOT_VERIFIED (REQUIRE_SME_VERIFICATION=true and the SME is not verified)', ...json(ref('ErrorResponse')) },
             404: { description: 'SME_NOT_FOUND (unknown smeId)', ...json(ref('ErrorResponse')) },
-            409: { description: 'Duplicate invoice or possible duplicate receivable', ...json(DuplicateError) },
+            409: {
+              description: 'Duplicate invoice or possible duplicate receivable, or IDEMPOTENCY_IN_PROGRESS (retry after Retry-After)',
+              headers: { 'Retry-After': { schema: { type: 'string' } } },
+              ...json(DuplicateError),
+            },
             415: { description: 'Content-Type must be application/json (UNSUPPORTED_MEDIA_TYPE)', ...json(ref('ErrorResponse')) },
+            ...IdempotencyErrors,
           },
         },
       },
@@ -558,19 +589,26 @@ function createSpec(baseUrl) {
             'Every attempt, accepted or rejected (400, 404, 409, 422), is recorded in the audit log as `invoice.fund`, ' +
             'with the invoice `fundedAmount` and `status` before and after. A contribution is either accepted in full ' +
             'or rejected with a 422; set allowPartial to true to explicitly cap it at the remaining capacity.',
-          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }, IdempotencyKeyParam],
           requestBody: { required: true, ...json(FundRequest) },
           responses: {
-            200: { description: 'Updated invoice', ...json(FundResponse) },
+            200: { description: 'Updated invoice', headers: IdempotencyHeaders, ...json(FundResponse) },
             400: {
               description: 'Invalid amount (non-finite, non-positive, above face value), missing/invalid investor, ' +
                 'unknown body key or invalid id (VALIDATION_FAILED)',
               ...json(FundingError),
             },
             404: { description: 'Not found', ...json(ErrorBody) },
-            409: { description: 'Invoice not open', ...json(ErrorBody) },
+            409: {
+              description: 'Invoice not open, or IDEMPOTENCY_IN_PROGRESS (retry after Retry-After)',
+              headers: { 'Retry-After': { schema: { type: 'string' } } },
+              ...json(ErrorBody),
+            },
             415: { description: 'Content-Type must be application/json (UNSUPPORTED_MEDIA_TYPE)', ...json(ref('ErrorResponse')) },
-            422: { description: 'Contribution exceeds remaining capacity, or self-funding not allowed', ...json(FundingError) },
+            422: {
+              description: 'Contribution exceeds remaining capacity, self-funding not allowed, or IDEMPOTENCY_KEY_REUSED',
+              ...json(FundingError),
+            },
           },
         },
       },

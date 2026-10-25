@@ -13,6 +13,7 @@ const escrowReader = require('./escrow');
 const { CreateInvoiceBody, FundInvoiceBodyShape, InvoiceIdParam } = require('../schemas');
 const { validate } = require('../middleware/validate');
 const emitter = require('../webhooks/emitter');
+const idempotency = require('../middleware/idempotency');
 const smes = require('../data/smes');
 
 const router = express.Router();
@@ -188,7 +189,7 @@ function applySmeIdentity(value) {
   return null;
 }
 
-router.post('/', validate({ body: CreateInvoiceBody, audit: 'invoice.create' }), (req, res) => {
+router.post('/', idempotency, validate({ body: CreateInvoiceBody, audit: 'invoice.create' }), (req, res) => {
   const value = toInvoiceValue(req.validatedBody);
   const smeRejection = applySmeIdentity(value);
   if (smeRejection) {
@@ -229,7 +230,7 @@ router.post('/', validate({ body: CreateInvoiceBody, audit: 'invoice.create' }),
   return res.status(201).json({ data: present(invoice) });
 });
 
-router.post('/:id/fund', validate({ params: InvoiceIdParam, body: FundInvoiceBodyShape, audit: 'invoice.fund' }), (req, res) => {
+router.post('/:id/fund', idempotency, validate({ params: InvoiceIdParam, body: FundInvoiceBodyShape, audit: 'invoice.fund' }), (req, res) => {
   const record = (details) =>
     req.audit({ action: 'invoice.fund', resourceType: 'invoice', resourceId: req.params.id, ...details });
   const reject = (statusCode, error, details, extra = {}) => {
