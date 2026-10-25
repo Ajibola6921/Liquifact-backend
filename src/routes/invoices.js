@@ -7,6 +7,7 @@ const { auditContext } = require('../audit/middleware');
 const contributions = require('../data/contributions');
 const config = require('../config');
 const { toMinor, fromMinor, couponMinor, daysBetween, annualisedBps } = require('../domain/returns');
+const { ApiError, badRequest, notFound, conflict, unprocessable, sendProblem } = require('../errors');
 const { parseInvoiceQuery, queryInvoices, InvoiceQueryError } = require('../services/invoice-query');
 const { requireAdminToken } = require('../middleware/require-admin-token');
 const escrowReader = require('./escrow');
@@ -82,14 +83,16 @@ router.get('/', (req, res) => {
     if (!(error instanceof InvoiceQueryError)) {
       throw error;
     }
-    return res.status(400).json({ error: error.message, code: error.code, details: error.details });
+    const fieldErrors = Object.entries(error.details || {}).map(([field, message]) => ({ field, message }));
+    // Keep the parameter-keyed `details` map existing clients rely on, alongside RFC 7807 `errors`.
+    throw new ApiError(400, error.code, error.message, { errors: fieldErrors, extra: { details: error.details } });
   }
 });
 
 router.get('/:id', idParam(), (req, res) => {
   const invoice = store.get(req.params.id);
   if (!invoice) {
-    return res.status(404).json({ error: 'Invoice not found' });
+    throw notFound('INVOICE_NOT_FOUND');
   }
   return res.json({ data: present(invoice) });
 });
@@ -97,20 +100,20 @@ router.get('/:id', idParam(), (req, res) => {
 router.get('/:id/quote', idParam(), (req, res) => {
   const invoice = store.get(req.params.id);
   if (!invoice) {
-    return res.status(404).json({ error: 'INVOICE_NOT_FOUND', code: 'INVOICE_NOT_FOUND' });
+    throw notFound('INVOICE_NOT_FOUND');
   }
   if (invoice.status !== 'open') {
-    return res.status(409).json({ error: 'INVOICE_NOT_OPEN', code: 'INVOICE_NOT_OPEN' });
+    throw conflict('INVOICE_NOT_OPEN');
   }
   const { amount, asOf } = req.query;
   if (typeof amount !== 'string' || !/^(?:0|[1-9]\d*)(?:\.\d{1,7})?$/.test(amount)) {
-    return res.status(400).json({ error: 'INVALID_AMOUNT', code: 'INVALID_AMOUNT' });
+    throw badRequest('INVALID_AMOUNT');
   }
   const parsedAsOf = typeof asOf === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(asOf)
     ? new Date(`${asOf}T00:00:00.000Z`)
     : null;
   if (asOf !== undefined && (!parsedAsOf || Number.isNaN(parsedAsOf.getTime()) || parsedAsOf.toISOString().slice(0, 10) !== asOf)) {
-    return res.status(400).json({ error: 'INVALID_AS_OF', code: 'INVALID_AS_OF' });
+    throw badRequest('INVALID_AS_OF');
   }
   let principalMinor;
   let capacityMinor;
@@ -118,18 +121,18 @@ router.get('/:id/quote', idParam(), (req, res) => {
     principalMinor = toMinor(amount);
     capacityMinor = toMinor(invoice.amount) - toMinor(invoice.fundedAmount);
   } catch {
-    return res.status(400).json({ error: 'INVALID_AMOUNT', code: 'INVALID_AMOUNT' });
+    throw badRequest('INVALID_AMOUNT');
   }
   if (principalMinor <= 0n) {
-    return res.status(400).json({ error: 'INVALID_AMOUNT', code: 'INVALID_AMOUNT' });
+    throw badRequest('INVALID_AMOUNT');
   }
   if (principalMinor > capacityMinor) {
-    return res.status(422).json({ error: 'EXCEEDS_CAPACITY', code: 'EXCEEDS_CAPACITY' });
+    throw unprocessable('EXCEEDS_CAPACITY');
   }
   const quoteAsOf = asOf || new Date().toISOString().slice(0, 10);
   const daysToMaturity = daysBetween(quoteAsOf, invoice.dueDate);
   if (daysToMaturity <= 0) {
-    return res.status(409).json({ error: 'INVOICE_MATURED', code: 'INVOICE_MATURED' });
+    throw conflict('INVOICE_MATURED');
   }
   const coupon = couponMinor(principalMinor, invoice.yieldBps);
   const { simpleAnnualisedBps, effectiveAnnualisedBps } = annualisedBps(invoice.yieldBps, daysToMaturity);
@@ -237,7 +240,14 @@ router.post('/:id/fund', requireRole('investor', 'admin'), idempotency, validate
     req.audit({ action: 'invoice.fund', resourceType: 'invoice', resourceId: req.params.id, ...details });
   const reject = (statusCode, error, details, extra = {}) => {
     record({ outcome: 'rejected', statusCode, metadata: { error, ...details.metadata }, before: details.before });
-    return res.status(statusCode).json({ error, ...extra });
+    const { code: extraCode, ...rest } = extra;
+    const isCode = /^[A-Z_]+$/.test(error);
+    const code = extraCode || (isCode ? error : { 404: 'INVOICE_NOT_FOUND', 409: 'INVOICE_NOT_OPEN' }[statusCode]);
+    return sendProblem(req, res, code, {
+      status: statusCode,
+      detail: isCode ? undefined : error,
+      extra: Object.keys(rest).length ? rest : undefined,
+    });
   };
 
   const invoice = store.get(req.params.id);
@@ -310,14 +320,14 @@ router.post('/:id/fund', requireRole('investor', 'admin'), idempotency, validate
 router.get('/:id/contributions', idParam(), (req, res) => {
   const invoice = store.get(req.params.id);
   if (!invoice) {
-    return res.status(404).json({ error: 'Invoice not found' });
+    throw notFound('INVOICE_NOT_FOUND');
   }
 
   let limit = 50;
   if (req.query.limit !== undefined) {
     limit = Number(req.query.limit);
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
-      return res.status(400).json({ error: 'limit must be an integer between 1 and 100' });
+      throw badRequest('INVALID_LIMIT');
     }
   }
 
@@ -326,7 +336,7 @@ router.get('/:id/contributions', idParam(), (req, res) => {
   if (req.query.cursor) {
     const idx = all.findIndex((c) => c.id === req.query.cursor);
     if (idx === -1) {
-      return res.status(400).json({ error: 'Invalid cursor' });
+      throw badRequest('INVALID_CURSOR');
     }
     startIndex = idx + 1;
   }
@@ -370,7 +380,7 @@ function transitionAudit(req, res, action) {
   return {
     reject(statusCode, error, before = null) {
       record({ outcome: 'rejected', statusCode, before, metadata: { error } });
-      return res.status(statusCode).json({ error });
+      return sendProblem(req, res, statusCode === 404 ? 'INVOICE_NOT_FOUND' : 'INVALID_STATE_TRANSITION', { detail: error });
     },
     success(before, updated) {
       record({ outcome: 'success', statusCode: 200, before, after: { fundedAmount: updated.fundedAmount, status: updated.status } });
@@ -530,9 +540,9 @@ router.post('/:id/escrow', requireAdminToken, idParam(), async (req, res) => {
   if (mismatches.length) {
     return res.status(422).json({ code: 'ESCROW_TERMS_MISMATCH', mismatches });
   }
-  const conflict = store.linkEscrow(invoice, contractId);
-  if (conflict) {
-    return res.status(409).json({ code: conflict, error: 'Escrow link conflict' });
+  const linkConflict = store.linkEscrow(invoice, contractId);
+  if (linkConflict) {
+    return res.status(409).json({ code: linkConflict, error: 'Escrow link conflict' });
   }
   req.audit({
     action: 'invoice.escrow.link',
